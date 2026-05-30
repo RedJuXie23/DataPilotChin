@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.egg-info/
+dist/
+build/
+*.egg
+venv/
+.venv/
+ENV/
+.env
+.env.local
+.env.*.local
+
+# Node
+node_modules/
+.next/
+out/
+dist/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build artifacts
+*.tsbuildinfo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Data files (keep sample_data.csv as example, ignore generated data)
+backend/data/*.csv
+!backend/data/.gitkeep
+
+# Generated images
+area_histogram.png
+*.png
+*.jpg
+*.jpeg
+!.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

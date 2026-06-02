@@ -20,22 +20,19 @@
 ```bash
 cd backend
 
-# 一键启动（自动创建 .env、创建虚拟环境、安装依赖、启动服务）
+# 一键启动（自动安装依赖 + 启动服务）
 start.bat
 ```
 
 后端默认运行在 **http://localhost:8001**
 
-> 💡 首次运行会自动：
-> 1. 从 `.env.template` 创建 `.env` 文件
-> 2. 创建 Python 虚拟环境
-> 3. 安装依赖
+> 💡 首次运行会自动创建虚拟环境并安装依赖
 >
-> 🔧 也可手动配置：
+> 🔧 如需手动配置：
 > ```bash
 > pip install -r requirements.txt
 > copy .env.template .env
-> # 编辑 .env 填入 API Key（或在网页界面中设置）
+> # 编辑 .env 填入 API Key
 > python app.py
 > ```
 
@@ -47,6 +44,9 @@ cd frontend
 # 安装依赖
 npm install
 
+# 创建本地前端配置
+copy .env.example .env.local
+
 # 开发模式启动（支持热更新）
 npm run dev
 ```
@@ -55,6 +55,7 @@ npm run dev
 
 > ⚙️ 前端配置文件：
 > - `frontend/.env.local` — API 地址（默认 `http://localhost:8001`）
+> - `frontend/.env.example` — 可提交到仓库的配置模板
 > - `frontend/src/app/globals.css` — 主题配色
 > - `frontend/src/components/ThemeProvider.tsx` — 深色/浅色模式切换
 
@@ -77,38 +78,33 @@ npm run dev
    - 可执行 Python 代码（支持编辑 + 重新执行）
    - 交互式 Plotly 图表
 
+## ⚠️ 安全提示
+
+- DataPilot 会在本机执行模型生成的 Python 代码。建议先检查代码，并在隔离的虚拟环境或容器中运行。
+- 默认配置适用于本地使用。不要在未增加身份认证、权限控制和执行沙箱的情况下直接暴露到公网。
+- 不要上传包含隐私、商业机密或其他敏感信息的数据文件。
+- 不要提交 `backend/.env` 或 `frontend/.env.local`。API Key 仅应保存在本地配置中。
+
 > 🌙 点击左侧边栏 ⚡ DataPilot 旁的 ☀️/🌙 图标切换深色/浅色主题
 
 ## ⚙️ 环境变量
 
-### 后端配置（`backend/`）
-
-后端配置通过 `backend/.env` 文件管理（从 `backend/.env.template` 复制）。
-
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
-| `LLM_PROVIDER` | LLM 提供商 | `openai` |
-| `LLM_MODEL` | 模型名称 | `gpt-4o-mini` |
+| 变量 | 说明 | 默认值 |
+|------|------|--------|
+| `LLM_PROVIDER` | LLM 提供商 | `deepseek` |
+| `LLM_MODEL` | 模型名称 | `deepseek-chat` |
 | `OPENAI_API_KEY` | OpenAI API Key | - |
 | `ANTHROPIC_API_KEY` | Anthropic API Key | - |
 | `GEMINI_API_KEY` | Gemini API Key | - |
 | `DEEPSEEK_API_KEY` | DeepSeek API Key | - |
 | `HOST` | 后端监听地址 | `0.0.0.0` |
 | `PORT` | 后端监听端口 | `8000` |
+| HOST | 后端监听地址 | 0.0.0.0 |
+| PORT | 后端监听端口 | 8000 |
 
-> 💡 首次运行 `start.bat` 时会自动创建 `.env` 文件（从模板复制）
->
-> 💡 **推荐方式**：也可以直接在网页界面中设置 API Key（无需编辑配置文件）
-
-### 前端配置（`frontend/`）
-
-前端配置文件为 `frontend/.env.local`（不会被提交到 Git）：
-
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| `NEXT_PUBLIC_API_URL` | 后端 API 地址 | `http://localhost:8001` |
-
-> ⚠️ 如果后端部署在不同地址，修改此配置
+> 💡 也可以在前端设置面板中动态切换模型和 API Key
 
 ## 🏗️ 项目架构
 

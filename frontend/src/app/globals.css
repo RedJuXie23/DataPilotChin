@@ -81,3 +81,29 @@ body {
 .prose a {
   color: var(--accent);
 }
+
+.chart-tool-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  font-size: 18px;
+  line-height: 1;
+  transition: background-color 150ms ease, border-color 150ms ease, color 150ms ease;
+}
+
+.chart-tool-button:hover {
+  border-color: var(--accent);
+  color: var(--text-primary);
+}
+
+.chart-tool-button-active {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #ffffff;
+}

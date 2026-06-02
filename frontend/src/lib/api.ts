@@ -20,9 +20,19 @@ export interface ModelConfig {
 export interface DatasetInfo {
   loaded: boolean;
   name?: string;
+  filename?: string;
   shape?: number[];
   columns?: string[];
   description?: string;
+  datasets?: DatasetSummary[];
+}
+
+export interface DatasetSummary {
+  name: string;
+  filename: string;
+  shape: number[];
+  columns: string[];
+  primary: boolean;
 }
 
 export interface ChatMessage {
@@ -30,12 +40,13 @@ export interface ChatMessage {
   role: 'user' | 'assistant' | 'system';
   content: string;
   agent?: string;
+  agentEventKey?: string;
   timestamp: number;
 }
 
 // ── 新架构：智能体状态 & 消息流类型 ─────────────────────
 
-export type AgentStatus = 'idle' | 'thinking' | 'working' | 'reviewing' | 'done' | 'error';
+export type AgentStatus = 'idle' | 'thinking' | 'working' | 'reviewing' | 'done' | 'error' | 'stopped';
 
 export interface AgentStateSnapshot {
   [agentName: string]: {
@@ -115,13 +126,20 @@ export interface SseEventError {
   task_state?: TaskStateSnapshot;
 }
 
+export interface SseEventStopped {
+  type: 'stopped';
+  content: string;
+  task_state?: TaskStateSnapshot;
+}
+
 export type SseEvent =
   | SseEventAgentStatus
   | SseEventMessage
   | SseEventResult
   | SseEventReview
   | SseEventFinal
-  | SseEventError;
+  | SseEventError
+  | SseEventStopped;
 
 // ── API 调用 ──────────────────────────────────────────────────
 
@@ -132,10 +150,12 @@ export async function createSession(): Promise<string> {
 }
 
 export interface UploadResult {
+  name: string;
   filename: string;
   shape: number[];
   columns: string[];
   description: string;
+  datasets: DatasetSummary[];
 }
 
 export async function uploadDataset(sessionId: string, file: File, description: string = ''): Promise<UploadResult> {
@@ -159,17 +179,31 @@ export async function getDatasetInfo(sessionId: string): Promise<DatasetInfo> {
   return res.json();
 }
 
+export async function deleteDataset(sessionId: string, datasetName: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/session/${sessionId}/dataset/${encodeURIComponent(datasetName)}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: '删除失败' }));
+    throw new Error(err.detail || '删除失败');
+  }
+}
+
 export async function getModelConfig(sessionId: string): Promise<ModelConfig> {
   const res = await fetch(`${API_BASE}/session/${sessionId}/model`);
   return res.json();
 }
 
 export async function setModelConfig(sessionId: string, config: ModelConfig): Promise<void> {
-  await fetch(`${API_BASE}/session/${sessionId}/model`, {
+  const res = await fetch(`${API_BASE}/session/${sessionId}/model`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(config),
   });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Failed to save model settings' }));
+    throw new Error(err.detail || 'Failed to save model settings');
+  }
 }
 
 export async function getAgents(): Promise<Agent[]> {
@@ -183,12 +217,14 @@ export async function getAgents(): Promise<Agent[]> {
 export async function chatWithPlanner(
   sessionId: string,
   query: string,
-  onEvent: (event: SseEvent) => void
+  onEvent: (event: SseEvent) => void,
+  signal?: AbortSignal
 ): Promise<void> {
   const res = await fetch(`${API_BASE}/session/${sessionId}/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ query }),
+    signal,
   });
 
   if (!res.ok) {
@@ -229,11 +265,12 @@ export async function chatWithPlanner(
 
 // ── 兼容旧接口：与非编排智能体对话（非流式）─────────────
 
-export async function chatWithAgent(sessionId: string, agentName: string, query: string): Promise<any> {
+export async function chatWithAgent(sessionId: string, agentName: string, query: string, signal?: AbortSignal): Promise<any> {
   const res = await fetch(`${API_BASE}/chat/${agentName}?session_id=${sessionId}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ query }),
+    signal,
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: '请求失败' }));
@@ -294,7 +331,7 @@ export async function executeCode(sessionId: string, code: string): Promise<{ st
   const res = await fetch(`${API_BASE}/session/${sessionId}/execute-code`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ code, error: '' }),
+    body: JSON.stringify({ code }),
   });
   const data = await res.json();
   return data;

@@ -10,7 +10,7 @@ const Plot = dynamic(() => import('react-plotly.js'), { ssr: false })
 import {
   createSession, uploadDataset, getDatasetInfo,
   getModelConfig, setModelConfig, getAgents, getAgentsStatus,
-  chatWithAgent, chatWithPlanner, fixCode, executeCode, stopChat,
+  chatWithAgent, chatWithPlanner, fixCode, executeCode, stopChat, deleteDataset,
   type Agent, type ChatMessage, type ModelConfig, type DatasetInfo,
 } from '@/lib/api'
 
@@ -30,8 +30,21 @@ interface ParsedSegment {
   content: string
 }
 
+function getPlotlySemanticKey(jsonData: string): string {
+  try {
+    const figure = JSON.parse(jsonData)
+    return JSON.stringify({
+      data: figure.data || [],
+      annotations: figure.data?.length ? [] : figure.layout?.annotations || [],
+    })
+  } catch {
+    return jsonData
+  }
+}
+
 function parsePlotlyMarkers(text: string): ParsedSegment[] {
   const segments: ParsedSegment[] = []
+  const seenCharts = new Set<string>()
   const regex = /<<<PLOTLY_JSON>>>\n([\s\S]*?)\n<<<END_PLOTLY_JSON>>>/g
   let lastIndex = 0
   let match
@@ -39,7 +52,12 @@ function parsePlotlyMarkers(text: string): ParsedSegment[] {
     if (match.index > lastIndex) {
       segments.push({ type: 'markdown', content: text.slice(lastIndex, match.index) })
     }
-    segments.push({ type: 'plotly', content: match[1].trim() })
+    const chartContent = match[1].trim()
+    const chartKey = getPlotlySemanticKey(chartContent)
+    if (!seenCharts.has(chartKey)) {
+      seenCharts.add(chartKey)
+      segments.push({ type: 'plotly', content: chartContent })
+    }
     lastIndex = match.index + match[0].length
   }
   if (lastIndex < text.length) {
@@ -51,35 +69,157 @@ function parsePlotlyMarkers(text: string): ParsedSegment[] {
   return segments
 }
 
+function normalizePlotlyLayout(figData: any) {
+  const layout = figData.layout || {}
+  const traces = figData.data || []
+  const isHistogram = traces.some((trace: any) => trace.type === 'histogram')
+  const shouldStartYAxisAtZero = traces.some((trace: any) =>
+    ['bar', 'histogram'].includes(trace.type)
+  )
+
+  const normalizeAxis = (axis: any = {}, startAtZero = false, fallbackTitle = '') => {
+    const { range: _ignoredRange, fixedrange: _ignoredFixedRange, ...rest } = axis
+    return {
+      ...rest,
+      autorange: true,
+      automargin: true,
+      ...(axis.title || !fallbackTitle ? {} : { title: { text: fallbackTitle } }),
+      ...(startAtZero ? { rangemode: 'tozero' } : {}),
+    }
+  }
+
+  const normalizedAxes = Object.fromEntries(
+    Object.entries(layout)
+      .filter(([key]) => /^xaxis\d*$|^yaxis\d*$/.test(key))
+      .map(([key, axis]) => [
+        key,
+        normalizeAxis(axis, shouldStartYAxisAtZero && key.startsWith('yaxis')),
+      ])
+  )
+
+  return {
+    ...layout,
+    width: undefined,
+    height: undefined,
+    ...normalizedAxes,
+    xaxis: normalizeAxis(layout.xaxis, false, isHistogram ? '数值' : ''),
+    yaxis: normalizeAxis(layout.yaxis, shouldStartYAxisAtZero, isHistogram ? '计数' : ''),
+    autosize: true,
+    dragmode: 'pan',
+    paper_bgcolor: 'transparent',
+    plot_bgcolor: 'transparent',
+    font: { color: '#ccc', ...(layout.font || {}) },
+    margin: {
+      t: Math.max(56, layout.margin?.t || 0),
+      r: Math.max(48, layout.margin?.r || 0),
+      b: Math.max(84, layout.margin?.b || 0),
+      l: Math.max(72, layout.margin?.l || 0),
+    },
+  }
+}
+
+async function loadPlotlyRuntime() {
+  const module = await import('plotly.js/dist/plotly')
+  return (module as any).default || module
+}
+
 // Plotly chart component
 function PlotlyChart({ jsonData }: { jsonData: string }) {
   const [figData, setFigData] = React.useState<any>(null)
   const [error, setError] = React.useState<string | null>(null)
+  const [dragMode, setDragMode] = React.useState<'pan' | 'zoom'>('pan')
+  const plotRef = useRef<any>(null)
+  const viewportRef = useRef<Record<string, any>>({})
+
   useEffect(() => {
     try {
       setFigData(JSON.parse(jsonData))
+      viewportRef.current = {}
     } catch {
       setError('Failed to parse chart data')
     }
   }, [jsonData])
+
+  const chartRevision = React.useMemo(() => `chart-${getPlotlySemanticKey(jsonData)}`, [jsonData])
+  const baseLayout = React.useMemo(
+    () => figData ? { ...normalizePlotlyLayout(figData), uirevision: chartRevision } : {},
+    [figData, chartRevision]
+  )
+  const chartLayout = React.useMemo(
+    () => ({ ...baseLayout, ...viewportRef.current, dragmode: dragMode }),
+    [baseLayout, dragMode]
+  )
+
+  const preserveViewport = useCallback((relayoutData: Record<string, any>) => {
+    Object.entries(relayoutData).forEach(([key, value]) => {
+      if (/^[xy]axis\d*\.(range\[[01]\]|autorange)$/.test(key)) {
+        viewportRef.current[key] = value
+      }
+    })
+  }, [])
+
+  const updateDragMode = useCallback(async (mode: 'pan' | 'zoom') => {
+    setDragMode(mode)
+    if (!plotRef.current) return
+    const Plotly = await loadPlotlyRuntime()
+    await Plotly.relayout(plotRef.current, { dragmode: mode })
+  }, [])
+
+  const resetView = useCallback(async () => {
+    if (!plotRef.current) return
+    const Plotly = await loadPlotlyRuntime()
+    const axisReset: Record<string, boolean> = {}
+    viewportRef.current = {}
+    Object.keys(plotRef.current._fullLayout || {}).forEach(key => {
+      if (/^xaxis\d*$|^yaxis\d*$/.test(key)) {
+        axisReset[`${key}.autorange`] = true
+      }
+    })
+    await Plotly.relayout(plotRef.current, { ...axisReset, dragmode: dragMode })
+  }, [dragMode])
+
+  const downloadChart = useCallback(async () => {
+    if (!plotRef.current) return
+    const Plotly = await loadPlotlyRuntime()
+    await Plotly.downloadImage(plotRef.current, {
+      format: 'png',
+      filename: 'datapilot-chart',
+      width: 1400,
+      height: 800,
+      scale: 2,
+    })
+  }, [])
+
   if (error) return <div className="text-red-400 text-sm p-2">⚠️ {error}</div>
   if (!figData) return <div className="text-[var(--text-secondary)] text-sm p-2">⏳ 加载图表中...</div>
   return (
-    <div className="my-3 rounded-lg overflow-hidden border border-[var(--border)]">
-      <Plot
-        data={figData.data || []}
-        layout={{
-          ...(figData.layout || {}),
-          autosize: true,
-          paper_bgcolor: 'transparent',
-          plot_bgcolor: 'transparent',
-          font: { color: '#ccc', ...(figData.layout?.font || {}) },
-          margin: { t: 40, r: 20, b: 40, l: 50, ...(figData.layout?.margin || {}) },
-        }}
-        config={{ responsive: true, displayModeBar: true, displaylogo: false, modeBarButtonsToRemove: ['lasso2d', 'select2d'] }}
-        style={{ width: '100%', height: '500px' }}
-        useResizeHandler
-      />
+    <div className="my-3 rounded-lg border border-[var(--border)] bg-[var(--bg-secondary)]">
+      <div className="flex items-center justify-end gap-1 border-b border-[var(--border)] px-3 py-2">
+        <button type="button" onClick={() => updateDragMode('pan')} title="拖动平移" className={`chart-tool-button ${dragMode === 'pan' ? 'chart-tool-button-active' : ''}`}>
+          ↔
+        </button>
+        <button type="button" onClick={() => updateDragMode('zoom')} title="框选缩放" className={`chart-tool-button ${dragMode === 'zoom' ? 'chart-tool-button-active' : ''}`}>
+          ⌕
+        </button>
+        <button type="button" onClick={resetView} title="恢复完整视图" className="chart-tool-button">
+          ↺
+        </button>
+        <button type="button" onClick={downloadChart} title="下载图片" className="chart-tool-button">
+          ↓
+        </button>
+      </div>
+      <div className="h-[560px] min-h-[560px] w-full">
+        <Plot
+          data={figData.data || []}
+          layout={chartLayout}
+          config={{ responsive: true, displayModeBar: false, displaylogo: false, scrollZoom: true, doubleClick: 'reset' }}
+          style={{ width: '100%', height: '100%' }}
+          useResizeHandler
+          onInitialized={(_, graphDiv) => { plotRef.current = graphDiv }}
+          onUpdate={(_, graphDiv) => { plotRef.current = graphDiv }}
+          onRelayout={preserveViewport}
+        />
+      </div>
     </div>
   )
 }
@@ -101,6 +241,18 @@ function MessageContent({ content }: { content: string }) {
   )
 }
 
+function formatMessageTime(timestamp: number): string {
+  if (!Number.isFinite(timestamp)) return ''
+  const date = new Date(timestamp)
+  if (Number.isNaN(date.getTime())) return ''
+  const pad = (value: number) => value.toString().padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === 'AbortError'
+}
+
 interface ChatSession {
   id: string
   title: string
@@ -111,6 +263,13 @@ const AGENT_LIST = [
   { name: "chancellor_agent", display: "丞相", emoji: "📜" },
   { name: "commander_agent", display: "太尉", emoji: "⚔️" },
   { name: "censor_agent", display: "御史大夫", emoji: "⚖️" },
+  { name: "preprocessing_agent", display: "数据预处理", emoji: "🔧" },
+  { name: "statistical_analytics_agent", display: "统计分析", emoji: "📊" },
+  { name: "sk_learn_agent", display: "机器学习", emoji: "🧠" },
+  { name: "data_viz_agent", display: "数据可视化", emoji: "📈" },
+]
+
+const WELCOME_AGENTS = [
   { name: "preprocessing_agent", display: "数据预处理", emoji: "🔧" },
   { name: "statistical_analytics_agent", display: "统计分析", emoji: "📊" },
   { name: "sk_learn_agent", display: "机器学习", emoji: "🧠" },
@@ -129,11 +288,14 @@ export default function ChatPage() {
   const [agents, setAgents] = useState<Agent[]>([])
   const [agentStatus, setAgentStatus] = useState<Record<string, { status: string; last_active: number | null; current_task: string | null }>>({})
   const [showSettings, setShowSettings] = useState(false)
+  const [settingsError, setSettingsError] = useState('')
   const [showUpload, setShowUpload] = useState(false)
   const [modelConfig, setModelConfigState] = useState<ModelConfig>({
     provider: 'deepseek', model: 'deepseek-chat', api_key: '',
   })
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const activeRequestControllerRef = useRef<AbortController | null>(null)
+  const activeRequestIdRef = useRef(0)
   
   // Code editing state
   const [editingCode, setEditingCode] = useState<string | null>(null)
@@ -144,6 +306,17 @@ export default function ChatPage() {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null)
   const [editSessionName, setEditSessionName] = useState('')
+
+  const invalidateActiveRequest = useCallback((sessionId = currentSessionId) => {
+    if (!activeRequestControllerRef.current) return
+    activeRequestIdRef.current += 1
+    activeRequestControllerRef.current.abort()
+    activeRequestControllerRef.current = null
+    setLoading(false)
+    if (sessionId) {
+      void stopChat(sessionId).catch(err => console.error('停止聊天失败:', err))
+    }
+  }, [currentSessionId])
 
   useEffect(() => {
     const saved = localStorage.getItem('datapilot-sessions')
@@ -161,7 +334,9 @@ export default function ChatPage() {
     } else {
       initSession()
     }
-    getAgents().then(setAgents)
+    getAgents()
+      .then(setAgents)
+      .catch(err => console.error('获取智能体列表失败:', err))
   }, [])
 
   useEffect(() => {
@@ -172,12 +347,16 @@ export default function ChatPage() {
 
   useEffect(() => {
     if (currentSessionId) {
-      getDatasetInfo(currentSessionId).then(setDataset)
-      getModelConfig(currentSessionId).then(cfg => setModelConfigState({
-        provider: cfg.provider || 'deepseek',
-        model: cfg.model || 'deepseek-chat',
-        api_key: cfg.has_api_key ? '••••••••' : '',
-      }))
+      getDatasetInfo(currentSessionId)
+        .then(setDataset)
+        .catch(err => console.error('获取数据集信息失败:', err))
+      getModelConfig(currentSessionId)
+        .then(cfg => setModelConfigState({
+          provider: cfg.provider || 'deepseek',
+          model: cfg.model || 'deepseek-chat',
+          api_key: cfg.has_api_key ? '••••••••' : '',
+        }))
+        .catch(err => console.error('获取模型配置失败:', err))
     }
   }, [currentSessionId])
 
@@ -185,12 +364,8 @@ export default function ChatPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
-  useEffect(() => {
-    const interval = setInterval(fetchAgentStatus, 2000)
-    return () => clearInterval(interval)
-  }, [currentSessionId])
-
   const initSession = async () => {
+    invalidateActiveRequest()
     try {
       const sid = await createSession()
       setCurrentSessionId(sid)
@@ -202,7 +377,33 @@ export default function ChatPage() {
     }
   }
 
-  const fetchAgentStatus = async () => {
+  const appendAgentMessage = useCallback((agent: string, content: string, timestamp = Date.now(), taskId = '') => {
+    if (!agent || !content) return
+    const agentEventKey = taskId ? `${taskId}:${agent}:${content}` : ''
+    setMessages(prev => {
+      const exists = agentEventKey
+        ? prev.some(message => message.agentEventKey === agentEventKey)
+        : prev.slice(-1).some(message => message.agent === agent && message.content === content)
+      if (exists) return prev
+      const assistantMsg: ChatMessage = {
+        id: `agent-${agent}-${timestamp}-${Math.random().toString(36).slice(2, 9)}`,
+        role: 'assistant',
+        content,
+        agent,
+        agentEventKey: agentEventKey || undefined,
+        timestamp,
+      }
+      const updated = [...prev, assistantMsg]
+      setSessions(prevSessions =>
+        prevSessions.map(session =>
+          session.id === currentSessionId ? { ...session, messages: updated } : session
+        )
+      )
+      return updated
+    })
+  }, [currentSessionId])
+
+  const fetchAgentStatus = useCallback(async () => {
     if (!currentSessionId) return
     try {
       const result = await getAgentsStatus(currentSessionId)
@@ -213,19 +414,22 @@ export default function ChatPage() {
       // 如果消息数组为空（如刚打开历史会话），则加载历史消息
       if (result && result.messages && result.messages.length > 0) {
         setMessages(prev => {
-          // 只有当没有任何assistant消息时才加载历史消息
-          const hasAssistantMessages = prev.some(m => m.role === 'assistant')
-          if (hasAssistantMessages) return prev
-          
           const newAgentMessages: ChatMessage[] = []
           result.messages.forEach((msg: any) => {
             const fromAgent = msg.from || msg.from_agent
-            if (fromAgent && fromAgent !== '人类审查员' && fromAgent !== '秦始皇' && msg.content) {
+            const toAgent = msg.to || msg.to_agent
+            const isUserFacing = toAgent === '秦始皇' || msg.type === 'direct_response'
+            const agentEventKey = msg.task_id ? `${msg.task_id}:${fromAgent}:${msg.content}` : ''
+            const exists = agentEventKey
+              ? [...prev, ...newAgentMessages].some(message => message.agentEventKey === agentEventKey)
+              : [...prev, ...newAgentMessages].slice(-1).some(message => message.agent === fromAgent && message.content === msg.content)
+            if (!exists && isUserFacing && fromAgent && fromAgent !== '人类审查员' && fromAgent !== '秦始皇' && msg.content) {
               newAgentMessages.push({
                 id: `agent-${fromAgent}-${msg.timestamp || Date.now()}`,
                 role: 'assistant',
                 content: msg.content,
                 agent: fromAgent,
+                agentEventKey: agentEventKey || undefined,
                 timestamp: msg.timestamp || Date.now(),
               })
             }
@@ -246,11 +450,19 @@ export default function ChatPage() {
     } catch (err) {
       console.error('获取智能体状态失败:', err)
     }
-  }
+  }, [currentSessionId])
+
+  useEffect(() => {
+    const interval = setInterval(fetchAgentStatus, 2000)
+    return () => clearInterval(interval)
+  }, [fetchAgentStatus])
 
   const handleSelectSession = (sessionId: string) => {
     const session = sessions.find(s => s.id === sessionId)
     if (session) {
+      if (sessionId !== currentSessionId) {
+        invalidateActiveRequest(currentSessionId)
+      }
       setCurrentSessionId(sessionId)
       setMessages(session.messages || [])
       // 清除loading状态，避免显示"分析中..."
@@ -264,6 +476,7 @@ export default function ChatPage() {
     e.stopPropagation()
     setSessions(prev => prev.filter(s => s.id !== sessionId))
     if (currentSessionId === sessionId) {
+      invalidateActiveRequest(sessionId)
       const next = sessions.find(s => s.id !== sessionId)
       if (next) {
         setCurrentSessionId(next.id)
@@ -301,6 +514,10 @@ export default function ChatPage() {
 
   const sendMessage = useCallback(async () => {
     if (!input.trim() || loading || !currentSessionId) return
+    activeRequestControllerRef.current?.abort()
+    const requestId = ++activeRequestIdRef.current
+    const controller = new AbortController()
+    activeRequestControllerRef.current = controller
     
     const userMsg: ChatMessage = {
       id: Date.now().toString(),
@@ -329,6 +546,7 @@ export default function ChatPage() {
 
     try {
       await chatWithPlanner(currentSessionId, userMsg.content, (event) => {
+        if (controller.signal.aborted || activeRequestIdRef.current !== requestId) return
         if (event.type === 'agent_status') {
           setAgentStatus(prev => {
             const newStatus = { ...prev }
@@ -343,36 +561,49 @@ export default function ChatPage() {
           // 实时显示智能体消息（流式输出）
           if (event.content && event.content.length > 0) {
             // 过滤掉简短的状态消息，只显示有意义的内容
-            if (event.content.length > 20 || event.status === 'done') {
-              setMessages(prev => {
-                // 检查是否已有相同消息
-                const exists = prev.some(
-                  m => m.agent === event.agent && 
-                       m.content.startsWith(event.content?.substring(0, 50) || '')
-                )
-                if (exists) return prev
-                
-                const assistantMsg: ChatMessage = {
-                  id: `agent-${event.agent}-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
-                  role: 'assistant',
-                  content: event.content || '',
-                  agent: event.agent,
-                  timestamp: Date.now(),
-                }
-                const updated = [...prev, assistantMsg]
-                setSessions(prevSessions =>
-                  prevSessions.map(s =>
-                    s.id === currentSessionId ? { ...s, messages: updated } : s
-                  )
-                )
-                return updated
-              })
+            if (event.agent === 'censor_agent' || event.content.length > 20 || ['done', 'error'].includes(event.status)) {
+              appendAgentMessage(
+                event.agent,
+                event.content,
+                Date.now(),
+                event.task_state?.states?.[event.agent]?.current_task || ''
+              )
             }
           }
+        } else if (event.type === 'stopped') {
+          setLoading(false)
+        } else if (event.type === 'error' || (event.type === 'final' && event.status !== 'success')) {
+          const errorContent = typeof event.content === 'string'
+            ? event.content
+            : [
+                event.content?.message || '任务执行失败',
+                ...Object.entries(event.content?.failed_agents || {}).map(
+                  ([agent, reason]) => `${agent}: ${String(reason)}`
+                ),
+                event.content?.review_comments ? `审查意见: ${event.content.review_comments}` : '',
+              ].filter(Boolean).join('\n')
+          setMessages(prev => {
+            const systemMsg: ChatMessage = {
+              id: `system-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+              role: 'system',
+              content: `Error: ${errorContent}`,
+              timestamp: Date.now(),
+            }
+            const updated = [...prev, systemMsg]
+            setSessions(prevSessions =>
+              prevSessions.map(s =>
+                s.id === currentSessionId ? { ...s, messages: updated } : s
+              )
+            )
+            return updated
+          })
         }
-      })
-      await fetchAgentStatus()
+      }, controller.signal)
+      if (!controller.signal.aborted && activeRequestIdRef.current === requestId) {
+        await fetchAgentStatus()
+      }
     } catch (err: any) {
+      if (isAbortError(err) || controller.signal.aborted || activeRequestIdRef.current !== requestId) return
       setMessages(prev => [...prev, {
         id: Date.now().toString(),
         role: 'system',
@@ -380,17 +611,24 @@ export default function ChatPage() {
         timestamp: Date.now(),
       }])
     } finally {
-      setLoading(false)
+      if (activeRequestIdRef.current === requestId) {
+        activeRequestControllerRef.current = null
+        setLoading(false)
+      }
     }
-  }, [input, loading, currentSessionId, messages])
+  }, [input, loading, currentSessionId, messages, appendAgentMessage, fetchAgentStatus])
 
   const handleStopChat = useCallback(async () => {
     if (!currentSessionId) return
+    activeRequestIdRef.current += 1
+    activeRequestControllerRef.current?.abort()
+    activeRequestControllerRef.current = null
     try {
       await stopChat(currentSessionId)
-      setLoading(false)
     } catch (err) {
       console.error('停止聊天失败:', err)
+    } finally {
+      setLoading(false)
     }
   }, [currentSessionId])
 
@@ -398,6 +636,10 @@ export default function ChatPage() {
     if (!input.trim() || loading || !currentSessionId) return
     
     const query = input.trim()
+    activeRequestControllerRef.current?.abort()
+    const requestId = ++activeRequestIdRef.current
+    const controller = new AbortController()
+    activeRequestControllerRef.current = controller
     setInput('')
     setLoading(true)
     
@@ -420,7 +662,8 @@ export default function ChatPage() {
     })
 
     try {
-      const result = await chatWithAgent(currentSessionId, agentName, query)
+      const result = await chatWithAgent(currentSessionId, agentName, query, controller.signal)
+      if (controller.signal.aborted || activeRequestIdRef.current !== requestId) return
       setMessages(prev => {
         const assistantMsg: ChatMessage = {
           id: Date.now().toString(),
@@ -438,6 +681,7 @@ export default function ChatPage() {
         return updated
       })
     } catch (err: any) {
+      if (isAbortError(err) || controller.signal.aborted || activeRequestIdRef.current !== requestId) return
       setMessages(prev => {
         const systemMsg: ChatMessage = {
           id: Date.now().toString(),
@@ -448,36 +692,50 @@ export default function ChatPage() {
         return [...prev, systemMsg]
       })
     } finally {
-      setLoading(false)
+      if (activeRequestIdRef.current === requestId) {
+        activeRequestControllerRef.current = null
+        setLoading(false)
+      }
     }
   }, [input, loading, currentSessionId])
 
-  const handleFileSelect = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files
-    if (!currentSessionId || !files || !files.length) return
-    const file = files[0]
-    
+  const refreshDatasets = useCallback(async () => {
+    if (!currentSessionId) return
+    setDataset(await getDatasetInfo(currentSessionId))
+  }, [currentSessionId])
+
+  const uploadFiles = useCallback(async (files: File[]) => {
+    if (!currentSessionId || files.length === 0) return
+    const uploaded: string[] = []
     try {
-      const info = await uploadDataset(currentSessionId, file)
-      setDataset({ loaded: true, name: 'df', shape: info.shape, columns: info.columns, description: info.description })
+      for (const file of files) {
+        await uploadDataset(currentSessionId, file)
+        uploaded.push(file.name)
+      }
+      await refreshDatasets()
       setShowUpload(false)
       setMessages(prev => [...prev, {
         id: Date.now().toString(),
         role: 'system',
-        content: `📁 Uploaded **${file.name}** (${info.shape?.[0]} rows × ${info.shape?.[1]} cols)`,
+        content: `📁 已上传 ${uploaded.length} 个文件：${uploaded.map(name => `**${name}**`).join('、')}`,
         timestamp: Date.now(),
       }])
     } catch (err: any) {
+      await refreshDatasets()
       setMessages(prev => [...prev, {
         id: Date.now().toString(),
         role: 'system',
-        content: `Upload failed: ${err.message}`,
+        content: `上传失败：${err.message}`,
         timestamp: Date.now(),
       }])
     }
-    // Reset input so same file can be re-selected
+  }, [currentSessionId, refreshDatasets])
+
+  const handleFileSelect = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    await uploadFiles(Array.from(e.target.files || []))
+    // Reset input so the same files can be selected again.
     e.target.value = ''
-  }, [currentSessionId])
+  }, [uploadFiles])
 
   // Drag & drop handlers for the upload modal area
   const handleDragOver = useCallback((e: React.DragEvent) => { e.preventDefault(); setIsDragOver(true) }, [])
@@ -485,37 +743,34 @@ export default function ChatPage() {
   const handleDrop = useCallback(async (e: React.DragEvent) => {
     e.preventDefault()
     setIsDragOver(false)
-    const files = e.dataTransfer.files
-    if (!currentSessionId || !files.length) return
-    const file = files[0]
-    
+    await uploadFiles(Array.from(e.dataTransfer.files || []))
+  }, [uploadFiles])
+
+  const handleDeleteDataset = useCallback(async (datasetName: string) => {
+    if (!currentSessionId) return
     try {
-      const info = await uploadDataset(currentSessionId, file)
-      setDataset({ loaded: true, name: 'df', shape: info.shape, columns: info.columns, description: info.description })
-      setShowUpload(false)
-      setMessages(prev => [...prev, {
-        id: Date.now().toString(),
-        role: 'system',
-        content: `📁 Uploaded **${file.name}** (${info.shape?.[0]} rows × ${info.shape?.[1]} cols)`,
-        timestamp: Date.now(),
-      }])
+      await deleteDataset(currentSessionId, datasetName)
+      await refreshDatasets()
     } catch (err: any) {
       setMessages(prev => [...prev, {
         id: Date.now().toString(),
         role: 'system',
-        content: `Upload failed: ${err.message}`,
+        content: `删除失败：${err.message}`,
         timestamp: Date.now(),
       }])
     }
-  }, [currentSessionId])
+  }, [currentSessionId, refreshDatasets])
 
   const saveModelConfig = useCallback(async () => {
     if (!currentSessionId) return
     try {
+      setSettingsError('')
       await setModelConfig(currentSessionId, modelConfig)
       localStorage.setItem('datapilot-model', JSON.stringify({ provider: modelConfig.provider, model: modelConfig.model }))
       setShowSettings(false)
-    } catch {}
+    } catch (err: any) {
+      setSettingsError(err.message || 'Failed to save model settings')
+    }
   }, [currentSessionId, modelConfig])
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -588,17 +843,39 @@ export default function ChatPage() {
         <div className="p-4 border-b border-[var(--border)]">
           <h3 className="text-sm font-semibold mb-2 text-[var(--text-secondary)]">数据集</h3>
           {dataset.loaded ? (
-            <div className="text-xs space-y-1">
-              <p className="text-green-400">✅ {dataset.name}</p>
-              <p className="text-[var(--text-secondary)]">{dataset.shape?.[0]} rows × {dataset.shape?.[1]} cols</p>
-              <details className="mt-2">
-                <summary className="cursor-pointer text-[var(--text-secondary)] hover:text-[var(--text-primary)]">列名</summary>
-                <div className="mt-1 max-h-32 overflow-y-auto">
-                  {dataset.columns?.map(col => (
-                    <p key={col} className="text-[var(--text-secondary)]">{col}</p>
-                  ))}
+            <div className="max-h-52 space-y-2 overflow-y-auto pr-1 text-xs">
+              {dataset.datasets?.map(item => (
+                <div key={item.name} className="rounded border border-[var(--border)] bg-[var(--bg-primary)] p-2">
+                  <div className="flex items-start gap-2">
+                    <span className="mt-0.5 text-green-400">✅</span>
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate font-medium text-[var(--text-primary)]" title={item.filename}>
+                        {item.filename}
+                      </p>
+                      <p className="text-[var(--text-secondary)]">{item.shape[0]} rows × {item.shape[1]} cols</p>
+                      <p className="truncate text-[var(--text-secondary)]" title={item.name}>
+                        {item.primary ? '主数据集' : `变量：${item.name}`}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleDeleteDataset(item.name)}
+                      title={`删除 ${item.filename}`}
+                      className="rounded p-1 text-[var(--text-secondary)] transition-colors hover:bg-red-500/10 hover:text-red-400"
+                    >
+                      ×
+                    </button>
+                  </div>
+                  <details className="mt-1">
+                    <summary className="cursor-pointer text-[var(--text-secondary)] hover:text-[var(--text-primary)]">列名</summary>
+                    <div className="mt-1 max-h-24 overflow-y-auto pl-2">
+                      {item.columns.map(col => (
+                        <p key={col} className="truncate text-[var(--text-secondary)]" title={col}>{col}</p>
+                      ))}
+                    </div>
+                  </details>
                 </div>
-              </details>
+              ))}
             </div>
           ) : (
             <p className="text-xs text-[var(--text-secondary)]">未加载数据集</p>
@@ -708,24 +985,12 @@ export default function ChatPage() {
                 <p className="text-[var(--text-secondary)] max-w-md">
                   上传 CSV 或 XLSX 文件，然后对数据进行提问。AI 规划器将自动把您的问题路由到合适的智能体。
                 </p>
-                {/* 智能体分为两行显示 */}
-                <div className="space-y-2">
-                  {/* 第一行：丞相、太尉、御史大夫 */}
-                  <div className="flex flex-wrap gap-2 justify-center">
-                    {agents.filter(a => ['chancellor_agent', 'commander_agent', 'censor_agent'].includes(a.name)).map(agent => (
-                      <span key={agent.name} className="text-sm px-3 py-1 bg-[var(--bg-secondary)] rounded-full border border-[var(--border)]">
-                        {agent.icon} {agent.display}
-                      </span>
-                    ))}
-                  </div>
-                  {/* 第二行：4个执行智能体 */}
-                  <div className="flex flex-wrap gap-2 justify-center">
-                    {agents.filter(a => !['chancellor_agent', 'commander_agent', 'censor_agent'].includes(a.name)).map(agent => (
-                      <span key={agent.name} className="text-sm px-3 py-1 bg-[var(--bg-secondary)] rounded-full border border-[var(--border)]">
-                        {agent.icon} {agent.display}
-                      </span>
-                    ))}
-                  </div>
+                <div className="flex flex-wrap gap-2 justify-center">
+                  {WELCOME_AGENTS.map(agent => (
+                    <span key={agent.name} className="text-sm px-3 py-1 bg-[var(--bg-secondary)] rounded-full border border-[var(--border)]">
+                      {agent.emoji} {agent.display}
+                    </span>
+                  ))}
                 </div>
               </div>
             </div>
@@ -753,7 +1018,12 @@ export default function ChatPage() {
                     : 'bg-[var(--bg-secondary)] border border-[var(--border)] rounded-tl-sm'
                 }`}>
                   {msg.agent && (
-                    <p className="text-xs text-brand-500 font-semibold mb-1">{AGENT_LIST.find(a => a.name === msg.agent)?.display || msg.agent}</p>
+                    <div className="mb-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs">
+                      <span className="font-semibold text-brand-500">{AGENT_LIST.find(a => a.name === msg.agent)?.display || msg.agent}</span>
+                      <time className="font-normal text-[var(--text-secondary)]" dateTime={new Date(msg.timestamp).toISOString()}>
+                        {formatMessageTime(msg.timestamp)}
+                      </time>
+                    </div>
                   )}
                   <MessageContent content={msg.content} />
                   {msg.role === 'assistant' && extractCodeFromMarkdown(msg.content) && (
@@ -799,13 +1069,13 @@ export default function ChatPage() {
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder={dataset.loaded ? "输入关于数据的问题..." : "请先上传数据集..."}
-              disabled={loading || !dataset.loaded}
+              placeholder={dataset.loaded ? "输入关于数据的问题..." : "可以直接对话，执行数据分析前请先上传文件..."}
+              disabled={loading}
               className="chat-input flex-1 bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg px-4 py-3 text-sm text-[var(--text-primary)] placeholder-[var(--text-secondary)] disabled:opacity-50"
             />
             <button
               onClick={sendMessage}
-              disabled={loading || !input.trim() || !dataset.loaded}
+              disabled={loading || !input.trim()}
               className="bg-brand-600 hover:bg-brand-700 disabled:opacity-50 text-white px-6 py-3 rounded-lg text-sm font-medium transition-colors"
             >
               发送
@@ -840,12 +1110,13 @@ export default function ChatPage() {
                 ref={fileInputRef}
                 type="file"
                 accept=".csv,.xlsx,.xls"
+                multiple
                 onChange={handleFileSelect}
                 className="hidden"
               />
               <div className="text-4xl mb-3">📁</div>
-              <p className="text-[var(--text-primary)] font-medium">点击或拖拽文件到此处</p>
-              <p className="text-[var(--text-secondary)] text-sm mt-1">支持 CSV, XLSX, XLS 格式</p>
+              <p className="text-[var(--text-primary)] font-medium">点击或拖拽一个或多个文件到此处</p>
+              <p className="text-[var(--text-secondary)] text-sm mt-1">支持 CSV, XLSX, XLS 格式，可批量上传</p>
             </div>
             <button
               onClick={() => setShowUpload(false)}
@@ -868,7 +1139,10 @@ export default function ChatPage() {
                 <label className="block text-sm text-[var(--text-secondary)] mb-1">提供商</label>
                 <select
                   value={modelConfig.provider}
-                  onChange={e => setModelConfigState(prev => ({ ...prev, provider: e.target.value }))}
+                  onChange={e => {
+                    setSettingsError('')
+                    setModelConfigState(prev => ({ ...prev, provider: e.target.value, api_key: '' }))
+                  }}
                   className="w-full bg-[var(--bg-tertiary)] border border-[var(--border)] rounded-lg px-3 py-2 text-sm text-[var(--text-primary)]"
                 >
                   <option value="openai">OpenAI</option>
@@ -928,6 +1202,9 @@ export default function ChatPage() {
               <p className="text-xs text-[var(--text-secondary)]">
                 API 密钥仅存储在当前浏览器会话中，仅在后端调用 LLM 时发送。
               </p>
+              {settingsError && (
+                <p className="text-xs text-red-400">{settingsError}</p>
+              )}
             </div>
             
             <div className="flex gap-3 mt-6">

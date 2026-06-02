@@ -2,7 +2,7 @@
 Format agent responses to markdown and execute generated code.
 Captures matplotlib figures as base64 PNG and plotly charts as embedded images.
 """
-# MUST be set before importing matplotlib — avoids Tkinter main-thread errors in sub-threads
+# MUST be set before importing matplotlib to avoid Tkinter main-thread errors in sub-threads.
 import matplotlib
 matplotlib.use('Agg')
 
@@ -12,8 +12,36 @@ import io
 import base64
 import traceback
 import contextlib
+import functools
+import threading
+import os
+import pickle
+import subprocess
+import tempfile
+import types
+import hashlib
 import pandas as pd
 import sys
+
+from src.runtime_config import CODE_EXECUTION_TIMEOUT_SECONDS, PLOTLY_EXPORT_TIMEOUT_SECONDS
+
+
+_EXECUTION_LOCK = threading.RLock()
+
+
+def _serialized_execution(fn):
+    """Serialize generated-code execution because plotting hooks are process-global."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _EXECUTION_LOCK:
+            return fn(*args, **kwargs)
+    return wrapper
+
+
+def execution_succeeded(output: str) -> bool:
+    """Return whether generated code completed without a captured runtime error."""
+    normalized = (output or "").lstrip()
+    return bool(normalized) and not normalized.startswith(("Error:", "No dataset loaded."))
 
 
 def extract_code_blocks(text: str) -> list:
@@ -56,10 +84,12 @@ def _plotly_fig_to_base64(fig) -> str | None:
 
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
-    t.join(timeout=500)  # 15秒超时
-
+    t.join(timeout=PLOTLY_EXPORT_TIMEOUT_SECONDS)
     if not result["done"]:
-        print("Warning: Plotly to base64 timed out (15s), skipping chart...")
+        print(
+            f"Warning: Plotly to base64 timed out ({PLOTLY_EXPORT_TIMEOUT_SECONDS}s), "
+            "skipping chart..."
+        )
         return None
     if result["exception"]:
         print(f"Warning: Plotly to base64 failed: {result['exception']}, skipping chart...")
@@ -100,37 +130,91 @@ def _plotly_fig_to_json_marker(fig) -> str | None:
         return None
 
 
-def execute_code_from_markdown(code_text: str, datasets: dict, timeout: int = 30) -> str:
-    """Execute Python code with session datasets in context.
-    Returns markdown string with text output and embedded images.
-    """
-    if not datasets:
-        return "No dataset loaded."
+def _plotly_fig_fingerprint(fig) -> str | None:
+    """Hash plotted data so cosmetic layout changes do not duplicate a chart."""
+    try:
+        fig_dict = _make_json_serializable(fig.to_dict())
+        semantic_payload = {"data": fig_dict.get("data", [])}
+        if not semantic_payload["data"]:
+            semantic_payload["annotations"] = fig_dict.get("layout", {}).get("annotations", [])
+        canonical = json.dumps(semantic_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    except Exception:
+        return None
+
+
+_CONTEXT_HELPERS = {"pd", "np", "plt", "go", "px", "sm", "sklearn", "json", "__builtins__"}
+_MAX_CONTEXT_ITEM_BYTES = int(os.getenv("DATAPILOT_CONTEXT_ITEM_MB", "64")) * 1024 * 1024
+_MAX_CONTEXT_BYTES = int(os.getenv("DATAPILOT_CONTEXT_TOTAL_MB", "256")) * 1024 * 1024
+
+
+def _copy_execution_value(value):
+    """Copy mutable tabular inputs while allowing model objects in the context."""
+    try:
+        return value.copy()
+    except (AttributeError, TypeError):
+        return value
+
+
+def _export_execution_context(context: dict) -> dict:
+    """Return bounded, pickle-safe variables for the next isolated execution."""
+    exported = {}
+    total_bytes = 0
+    for key, value in context.items():
+        if key.startswith("_") or key in _CONTEXT_HELPERS:
+            continue
+        if isinstance(value, types.ModuleType) or callable(value) or _is_plotly_figure(value):
+            continue
+        try:
+            serialized = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception:
+            continue
+        if len(serialized) > _MAX_CONTEXT_ITEM_BYTES or total_bytes + len(serialized) > _MAX_CONTEXT_BYTES:
+            continue
+        exported[key] = value
+        total_bytes += len(serialized)
+    return exported
+
+
+def _execute_code_from_markdown_impl(code_text: str, variables: dict, return_context: bool = False):
+    """Execute Python code with provided variables and optionally export updated state."""
+    if not variables:
+        output = "No dataset loaded."
+        return (output, {}) if return_context else output
 
     code_blocks = extract_code_blocks(code_text)
     code_to_run = "\n\n".join(code_blocks) if code_blocks else code_text
 
     if not code_to_run.strip():
-        return ""
+        return ("", {}) if return_context else ""
 
     # Build execution context
     context: dict = {}
-    for name, df in datasets.items():
-        context[name] = df.copy()
+    for name, value in variables.items():
+        context[name] = _copy_execution_value(value)
 
-    # Collected outputs
     text_output = ""
-    image_md_blocks = []   # markdown image strings (matplotlib only)
-    plotly_json_blocks = []  # plotly JSON markers for interactive rendering
+    image_md_blocks = []
+    plotly_json_blocks = []
+    plotly_json_seen = set()
 
-    # ---- Patch plt.show to capture matplotlib figures ----
-    _captured_figs = []
+    def _append_plotly_fig(fig):
+        marker = _plotly_fig_to_json_marker(fig)
+        if not marker:
+            return
+        fingerprint = _plotly_fig_fingerprint(fig) or marker
+        if fingerprint in plotly_json_seen:
+            return
+        plotly_json_seen.add(fingerprint)
+        plotly_json_blocks.append(marker)
+
     _orig_show = None
+    _orig_plotly_show = None
+
     try:
-        import matplotlib
         import matplotlib.pyplot as plt
         _orig_show = plt.show
-        # Instead of showing, capture current figure
+
         def _patched_show(*a, **kw):
             fig = plt.gcf()
             if fig.get_axes():
@@ -138,31 +222,27 @@ def execute_code_from_markdown(code_text: str, datasets: dict, timeout: int = 30
                 if b64:
                     image_md_blocks.append(f"![chart]({b64})")
             plt.close('all')
+
         plt.show = _patched_show
     except Exception:
         pass
 
-    # ---- Patch plotly Figure.show to capture as interactive JSON ----
-    _orig_plotly_show = None
     try:
         import plotly.graph_objects as go
         _orig_plotly_show = go.Figure.show
+
         def _patched_plotly_show(self, *a, **kw):
-            # 忽略 renderer 参数，始终捕获为 JSON 用于前端交互式渲染
-            # 如果指定了 renderer='json'，我们仍然捕获 JSON 标记
-            marker = _plotly_fig_to_json_marker(self)
-            if marker:
-                plotly_json_blocks.append(marker)
+            _append_plotly_fig(self)
+
         go.Figure.show = _patched_plotly_show
     except Exception:
         pass
 
-    # Common imports for user code
     import numpy as np
     context.update({
         "pd": pd,
         "np": np,
-        "plt": __import__("matplotlib.pyplot"),
+        "plt": __import__("matplotlib.pyplot", fromlist=["pyplot"]),
         "go": __import__("plotly.graph_objects", fromlist=["graph_objects"]),
         "px": __import__("plotly.express", fromlist=["express"]),
         "sm": __import__("statsmodels.api", fromlist=["api"]),
@@ -182,7 +262,6 @@ def execute_code_from_markdown(code_text: str, datasets: dict, timeout: int = 30
 
         text_output = buf.getvalue()
 
-        # Also capture any figures that were created but not shown
         try:
             import matplotlib.pyplot as plt
             fig = plt.gcf()
@@ -194,81 +273,50 @@ def execute_code_from_markdown(code_text: str, datasets: dict, timeout: int = 30
         except Exception:
             pass
 
-        # Also capture any plotly figures left in scope (even if fig.show() was not called)
-        # 强制捕获最后一个 plotly figure，确保即使没有 fig.show() 也能显示图表
-        last_fig = None
-        for key, val in context.items():
-            if key.startswith('_'):
-                continue
-            if _is_plotly_figure(val):
-                last_fig = val  # 记录最后一个图表
-        
-        # 如果通过 fig.show() 没有捕获到任何图表，但找到了 plotly figure，则捕获最后一个
-        if not plotly_json_blocks and last_fig:
-            marker = _plotly_fig_to_json_marker(last_fig)
-            if marker:
-                plotly_json_blocks.append(marker)
-        # 即使已经通过 fig.show() 捕获了图表，也尝试添加额外的图表（最多5个）
-        elif last_fig:
-            count = 0
+        # Fallback: capture one plotly figure from scope if user did not call fig.show().
+        if not plotly_json_blocks:
             for key, val in context.items():
-                if count >= 5:
-                    break
                 if key.startswith('_'):
                     continue
-                if _is_plotly_figure(val) and val != last_fig:
-                    marker = _plotly_fig_to_json_marker(val)
-                    if marker:
-                        plotly_json_blocks.append(marker)
-                        count += 1
+                if _is_plotly_figure(val):
+                    _append_plotly_fig(val)
+                    break
 
-        # Build final markdown
         parts = []
         if text_output.strip():
-            # Truncate very long output
             cleaned = text_output[:4000]
             if len(text_output) > 4000:
                 cleaned += "\n... (output truncated)"
             parts.append(f"```\n{cleaned}\n```")
+
         if image_md_blocks:
             parts.extend(image_md_blocks)
-        # Also capture any plotly figure left in scope
-        # 扫描context中的所有Plotly图表（无条件执行，确保捕获所有图表）
-        for key, val in context.items():
-            if key.startswith('_'):
-                continue
-            try:
-                if _is_plotly_figure(val):
-                    marker = _plotly_fig_to_json_marker(val)
-                    if marker:
-                        plotly_json_blocks.append(marker)
-                        break  # 一个代码块一个图表就足够了
-            except Exception:
-                continue
-        
-        # Embed Plotly JSON markers for frontend interactive rendering
+
         if plotly_json_blocks:
             parts.extend(plotly_json_blocks)
 
-        # Show any new DataFrames
         for key, value in context.items():
-            if isinstance(value, pd.DataFrame) and key not in datasets and not key.startswith('_'):
-                parts.append(f"\n**{key}** ({len(value)} rows × {len(value.columns)} cols):\n")
+            if isinstance(value, pd.DataFrame) and key not in variables and not key.startswith('_'):
+                parts.append(f"\n**{key}** ({len(value)} rows x {len(value.columns)} cols):\n")
                 parts.append(f"```\n{value.head(10).to_string()}\n```")
 
-        return "\n\n".join(parts) if parts else "_Code executed, no output._"
+        output = "\n\n".join(parts) if parts else "_Code executed, no output._"
+        if return_context:
+            return output, _export_execution_context(context)
+        return output
 
     except Exception as e:
         error_msg = f"Error: {type(e).__name__}: {str(e)}"
         tb = traceback.format_exc().splitlines()[-5:]
         error_msg += "\n" + "\n".join(tb)
+        if return_context:
+            return error_msg, {}
         return error_msg
     finally:
         pd.reset_option('display.max_columns')
         pd.reset_option('display.max_rows')
         pd.reset_option('display.width')
         pd.reset_option('display.max_colwidth')
-        # Restore patched functions
         try:
             import matplotlib.pyplot as plt
             if _orig_show:
@@ -281,6 +329,74 @@ def execute_code_from_markdown(code_text: str, datasets: dict, timeout: int = 30
                 go.Figure.show = _orig_plotly_show
         except Exception:
             pass
+
+
+_WORKER_SCRIPT = """
+import pickle
+import sys
+from src.format_response import _execute_code_from_markdown_impl
+
+code_text, variables, return_context = pickle.load(sys.stdin.buffer)
+result = _execute_code_from_markdown_impl(code_text, variables, return_context)
+with open(sys.argv[1], "wb") as result_file:
+    pickle.dump(result, result_file, protocol=pickle.HIGHEST_PROTOCOL)
+"""
+
+
+def _run_code_worker(code_text: str, variables: dict, timeout: int, return_context: bool):
+    """Execute generated code in a killable child process."""
+    backend_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    result_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pickle") as result_file:
+            result_path = result_file.name
+
+        completed = subprocess.run(
+            [sys.executable, "-c", _WORKER_SCRIPT, result_path],
+            input=pickle.dumps((code_text, variables, return_context), protocol=pickle.HIGHEST_PROTOCOL),
+            cwd=backend_root,
+            capture_output=True,
+            timeout=timeout,
+        )
+        if completed.returncode != 0:
+            stderr = completed.stderr.decode("utf-8", errors="replace").strip()
+            error = f"Error: RuntimeError: Generated code worker failed: {stderr or completed.returncode}"
+            return (error, {}) if return_context else error
+
+        with open(result_path, "rb") as result_file:
+            return pickle.load(result_file)
+    except subprocess.TimeoutExpired:
+        error = f"Error: TimeoutError: Generated code exceeded the {timeout}-second limit."
+        return (error, {}) if return_context else error
+    except Exception as e:
+        error = f"Error: RuntimeError: Generated code worker failed: {str(e)}"
+        return (error, {}) if return_context else error
+    finally:
+        if result_path:
+            try:
+                os.unlink(result_path)
+            except OSError:
+                pass
+
+
+@_serialized_execution
+def execute_code_from_markdown(
+    code_text: str,
+    datasets: dict,
+    timeout: int = CODE_EXECUTION_TIMEOUT_SECONDS,
+) -> str:
+    """Execute generated code and return its formatted output."""
+    return _run_code_worker(code_text, datasets, timeout, return_context=False)
+
+
+@_serialized_execution
+def execute_code_with_state(
+    code_text: str,
+    variables: dict,
+    timeout: int = CODE_EXECUTION_TIMEOUT_SECONDS,
+) -> tuple[str, dict]:
+    """Execute generated code and export pickle-safe variables for the next agent."""
+    return _run_code_worker(code_text, variables, timeout, return_context=True)
 
 
 def _is_plotly_figure(obj) -> bool:

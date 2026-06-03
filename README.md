@@ -6,7 +6,7 @@
 
 - 🔓 **无需登录** — 本地部署，开箱即用
 - 🏛️ **秦朝官职编排** — 丞相→太尉→执行智能体→御史大夫的四层架构
-- 🤖 **多模型支持** — 支持 OpenAI / Anthropic / DeepSeek / Gemini
+- 🤖 **多模型支持** — 支持 OpenAI / Anthropic / DeepSeek / Gemini / Groq
 - 📊 **四大执行智能体** — 数据预处理、统计分析、机器学习、数据可视化
 - 📁 **多格式支持** — 上传 CSV / XLSX / Parquet 文件即可开始分析
 - 💻 **代码执行** — 生成 Python 代码并实时执行，支持编辑与修复
@@ -63,7 +63,7 @@ npm run dev
 
 1. 打开浏览器访问 http://localhost:3000
 2. **配置 API**（点击右上角 ⚙️ 图标）：
-   - 选择模型提供商（DeepSeek / OpenAI / Anthropic / Gemini）
+   - 选择模型提供商（DeepSeek / OpenAI / Anthropic / Gemini / Groq）
    - 填入 API Key
    - 点击「保存」
 3. **上传数据**（点击右上角 📁 图标）：
@@ -91,18 +91,15 @@ npm run dev
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
 | `LLM_PROVIDER` | LLM 提供商 | `deepseek` |
 | `LLM_MODEL` | 模型名称 | `deepseek-chat` |
 | `OPENAI_API_KEY` | OpenAI API Key | - |
 | `ANTHROPIC_API_KEY` | Anthropic API Key | - |
 | `GEMINI_API_KEY` | Gemini API Key | - |
 | `DEEPSEEK_API_KEY` | DeepSeek API Key | - |
+| `GROQ_API_KEY` | Groq API Key | - |
 | `HOST` | 后端监听地址 | `0.0.0.0` |
 | `PORT` | 后端监听端口 | `8000` |
-| HOST | 后端监听地址 | 0.0.0.0 |
-| PORT | 后端监听端口 | 8000 |
 
 > 💡 也可以在前端设置面板中动态切换模型和 API Key
 
@@ -232,4 +229,4 @@ DataPilot/
 
 ## 📝 许可证
 
-本项目仅供学习研究使用。
+本项目为 2026 年研电赛 AI 智能体专项赛道作品，仅供学习研究使用。

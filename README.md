@@ -99,7 +99,7 @@ npm run dev
 | `DEEPSEEK_API_KEY` | DeepSeek API Key | - |
 | `GROQ_API_KEY` | Groq API Key | - |
 | `HOST` | 后端监听地址 | `0.0.0.0` |
-| `PORT` | 后端监听端口 | `8000` |
+| `PORT` | 后端监听端口 | `8001` |
 
 > 💡 也可以在前端设置面板中动态切换模型和 API Key
 

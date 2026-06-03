@@ -706,20 +706,41 @@ export default function ChatPage() {
 
   const uploadFiles = useCallback(async (files: File[]) => {
     if (!currentSessionId || files.length === 0) return
-    const uploaded: string[] = []
+    
     try {
-      for (const file of files) {
-        await uploadDataset(currentSessionId, file)
-        uploaded.push(file.name)
-      }
+      // 并行上传所有文件
+      const uploadPromises = files.map(file => 
+        uploadDataset(currentSessionId, file)
+          .then(result => ({ success: true, name: file.name, result }))
+          .catch(error => ({ success: false, name: file.name, error }))
+      )
+      
+      const results = await Promise.all(uploadPromises)
+      
+      const uploaded = results.filter(r => r.success).map(r => r.name)
+      const failed = results.filter(r => !r.success).map(r => ({ name: r.name, error: r.error?.message }))
+      
       await refreshDatasets()
       setShowUpload(false)
-      setMessages(prev => [...prev, {
-        id: Date.now().toString(),
-        role: 'system',
-        content: `📁 已上传 ${uploaded.length} 个文件：${uploaded.map(name => `**${name}**`).join('、')}`,
-        timestamp: Date.now(),
-      }])
+      
+      if (uploaded.length > 0) {
+        setMessages(prev => [...prev, {
+          id: Date.now().toString(),
+          role: 'system',
+          content: `📁 已上传 ${uploaded.length} 个文件：${uploaded.map(name => `**${name}**`).join('、')}`,
+          timestamp: Date.now(),
+        }])
+      }
+      
+      if (failed.length > 0) {
+        const errorMsg = failed.map(f => `${f.name}: ${f.error || '未知错误'}`).join('；')
+        setMessages(prev => [...prev, {
+          id: Date.now().toString(),
+          role: 'system',
+          content: `⚠️ 部分文件上传失败：${errorMsg}`,
+          timestamp: Date.now(),
+        }])
+      }
     } catch (err: any) {
       await refreshDatasets()
       setMessages(prev => [...prev, {

@@ -74,19 +74,29 @@ async def _run_sync(fn, *args, **kwargs):
     return await loop.run_in_executor(None, functools.partial(context.run, fn, *args, **kwargs))
 
 
+def _create_and_call_predict(signature, **kwargs):
+    """Create and call DSPy Predict object in the same context to avoid contextvar issues."""
+    predictor = dspy.Predict(signature)
+    return predictor(**kwargs)
+
+
+def _create_and_call_cot(signature, **kwargs):
+    """Create and call DSPy ChainOfThought object in the same context to avoid contextvar issues."""
+    cot = dspy.ChainOfThought(signature)
+    return cot(**kwargs)
+
+
 def asyncify_predict(signature):
     """Return an async callable for dspy.Predict(signature)."""
-    predictor = dspy.Predict(signature)
     async def call(**kwargs):
-        return await _run_sync(predictor, **kwargs)
+        return await _run_sync(_create_and_call_predict, signature, **kwargs)
     return call
 
 
 def asyncify_cot(signature):
     """Return an async callable for dspy.ChainOfThought(signature)."""
-    cot = dspy.ChainOfThought(signature)
     async def call(**kwargs):
-        return await _run_sync(cot, **kwargs)
+        return await _run_sync(_create_and_call_cot, signature, **kwargs)
     return call
 
 
@@ -1332,6 +1342,7 @@ class qin_dynasty_orchestrator(dspy.Module):
                 yield (agent_name, "working", f"正在执行: {instruction[:80]}...")
 
                 try:
+                    # 1. 智能体生成代码阶段 - 需要 DSPy 上下文
                     with dspy.context(lm=session_lm):
                         # 构建plan_instructions，确保不重复添加反馈
                         plan_instructions = json.dumps(subtask, ensure_ascii=False)
@@ -1360,79 +1371,81 @@ class qin_dynasty_orchestrator(dspy.Module):
                         
                         # 调试：记录转换后的字典
                         logger.info(f"{agent_name} 转换后的字典 keys: {list(result_dict.keys())}")
-                        
-                        # 执行代码并获取运行结果
-                        exec_result = ""
-                        code_to_exec = result_dict.get('code', '')
-                        code_executed_successfully = False
-                        logger.info(f"{agent_name} 提取的代码: '{code_to_exec[:200]}...', datasets长度: {len(datasets) if datasets else 0}")
-                        
-                        if code_to_exec and datasets is not None and len(datasets) > 0:
-                            try:
-                                from src.format_response import execute_code_with_state, execution_succeeded
-                                logger.info(f"{agent_name} 开始执行代码, context keys: {list(execution_context.keys())}")
-                                logger.info(f"{agent_name} 代码内容前500字符: {code_to_exec[:500]}")
-                                exec_result, updated_context = await asyncio.wait_for(
-                                    asyncio.to_thread(
-                                        execute_code_with_state,
-                                        code_to_exec,
-                                        execution_context,
-                                        CODE_EXECUTION_TIMEOUT_SECONDS,
-                                    ),
-                                    timeout=CODE_EXECUTION_OUTER_TIMEOUT_SECONDS,
-                                )
-                                code_executed_successfully = execution_succeeded(exec_result)
+                    
+                    # 2. 代码执行阶段 - 移出 DSPy 上下文，避免 contextvars 传递到子进程
+                    exec_result = ""
+                    code_to_exec = result_dict.get('code', '')
+                    code_executed_successfully = False
+                    logger.info(f"{agent_name} 提取的代码: '{code_to_exec[:200]}...', datasets长度: {len(datasets) if datasets else 0}")
+                    
+                    if code_to_exec and datasets is not None and len(datasets) > 0:
+                        try:
+                            from src.format_response import execute_code_with_state, execution_succeeded
+                            logger.info(f"{agent_name} 开始执行代码, context keys: {list(execution_context.keys())}")
+                            logger.info(f"{agent_name} 代码内容前500字符: {code_to_exec[:500]}")
+                            # 直接调用，不使用 _run_sync，因为代码执行使用子进程，不需要 contextvars
+                            exec_result, updated_context = await asyncio.wait_for(
+                                asyncio.to_thread(
+                                    execute_code_with_state,
+                                    code_to_exec,
+                                    execution_context,
+                                    CODE_EXECUTION_TIMEOUT_SECONDS,
+                                ),
+                                timeout=CODE_EXECUTION_OUTER_TIMEOUT_SECONDS,
+                            )
+                            code_executed_successfully = execution_succeeded(exec_result)
+                            if code_executed_successfully:
+                                execution_context.update(updated_context)
+                                if agent_name == "preprocessing_agent":
+                                    self._normalize_preprocessing_context(execution_context, datasets)
+                                if agent_name == "sk_learn_agent":
+                                    missing_ml_outputs = [
+                                        name for name in ("model", "y_test", "y_pred")
+                                        if name not in execution_context
+                                    ]
+                                    if missing_ml_outputs:
+                                        code_executed_successfully = False
+                                        exec_result = (
+                                            "Error: ML executor did not publish required outputs: "
+                                            + ", ".join(missing_ml_outputs)
+                                        )
+                                    else:
+                                        execution_context.setdefault("rf_model", execution_context["model"])
                                 if code_executed_successfully:
-                                    execution_context.update(updated_context)
-                                    if agent_name == "preprocessing_agent":
-                                        self._normalize_preprocessing_context(execution_context, datasets)
-                                    if agent_name == "sk_learn_agent":
-                                        missing_ml_outputs = [
-                                            name for name in ("model", "y_test", "y_pred")
-                                            if name not in execution_context
-                                        ]
-                                        if missing_ml_outputs:
-                                            code_executed_successfully = False
-                                            exec_result = (
-                                                "Error: ML executor did not publish required outputs: "
-                                                + ", ".join(missing_ml_outputs)
-                                            )
-                                        else:
-                                            execution_context.setdefault("rf_model", execution_context["model"])
-                                    if code_executed_successfully:
-                                        context_snapshots[i] = dict(execution_context)
-                                logger.info(f"{agent_name} 代码执行成功，结果长度: {len(exec_result)}")
-                                logger.info(f"{agent_name} 执行结果前200字符: {exec_result[:200]}")
-                            except Exception as exec_e:
-                                exec_result = f"代码执行错误: {str(exec_e)}"
-                                logger.error(f"{agent_name} 代码执行失败: {exec_e}", exc_info=True)
-                        else:
-                            logger.warning(f"{agent_name} 未执行代码: code_to_exec长度={len(code_to_exec) if code_to_exec else 0}, datasets长度={len(datasets) if datasets else 0}")
-                        
-                        # 将执行结果添加到result_dict
-                        result_dict['result'] = exec_result
-                        result_dict['code_executed'] = code_executed_successfully
-                        if not code_executed_successfully:
-                            result_dict['execution_error'] = exec_result or "Generated code did not execute successfully."
-                            upstream_failed = True
+                                    context_snapshots[i] = dict(execution_context)
+                            logger.info(f"{agent_name} 代码执行成功，结果长度: {len(exec_result)}")
+                            logger.info(f"{agent_name} 执行结果前200字符: {exec_result[:200]}")
+                        except Exception as exec_e:
+                            exec_result = f"代码执行错误: {str(exec_e)}"
+                            logger.error(f"{agent_name} 代码执行失败: {exec_e}", exc_info=True)
+                    else:
+                        logger.warning(f"{agent_name} 未执行代码: code_to_exec长度={len(code_to_exec) if code_to_exec else 0}, datasets长度={len(datasets) if datasets else 0}")
+                    
+                    # 将执行结果添加到result_dict
+                    result_dict['result'] = exec_result
+                    result_dict['code_executed'] = code_executed_successfully
+                    if not code_executed_successfully:
+                        result_dict['execution_error'] = exec_result or "Generated code did not execute successfully."
+                        upstream_failed = True
 
-                        # 生成详细的执行结果消息，包含思考、代码、结果
-                        detail_message = f"## {agent_name} 执行结果\n\n"
-                        if result_dict.get('summary'):
-                            detail_message += f"### 分析思考\n{result_dict['summary']}\n\n"
-                        if result_dict.get('code'):
-                            detail_message += f"### 程序代码\n```python\n{result_dict['code']}\n```\n\n"
-                        if exec_result:
-                            detail_message += f"### 运行结果\n{exec_result}\n"
-                        
-                        # 如果代码执行失败，在消息中明确标记
-                        if not code_executed_successfully and code_to_exec:
-                            detail_message += f"⚠️ **警告：代码执行失败，需要重新生成**\n"
-                        
-                        task_state.set_status(agent_name, "done" if code_executed_successfully else "error", task_id)
-                        # 返回完整的详细结果，用于实时显示
-                        attempt_messages.append((agent_name, detail_message))
-                        detail_messages[agent_name] = detail_message
+                    # 生成详细的执行结果消息，包含思考、代码、结果
+                    detail_message = f"## {agent_name} 执行结果\n\n"
+                    if result_dict.get('summary'):
+                        detail_message += f"### 分析思考\n{result_dict['summary']}\n\n"
+                    if result_dict.get('code'):
+                        detail_message += f"### 程序代码\n```python\n{result_dict['code']}\n```\n\n"
+                    if exec_result:
+                        detail_message += f"### 运行结果\n{exec_result}\n"
+                    
+                    # 如果代码执行失败，在消息中明确标记
+                    if not code_executed_successfully and code_to_exec:
+                        detail_message += f"⚠️ **警告：代码执行失败，需要重新生成**\n"
+                    
+                    task_state.set_status(agent_name, "done" if code_executed_successfully else "error", task_id)
+                    # 立即返回执行结果，让用户在御史大夫审查前就能看到
+                    yield (agent_name, "done", detail_message)
+                    attempt_messages.append((agent_name, detail_message))
+                    detail_messages[agent_name] = detail_message
 
                 except asyncio.TimeoutError:
                     task_state.set_status(agent_name, "error", task_id)
@@ -1576,12 +1589,13 @@ class qin_dynasty_orchestrator(dspy.Module):
 
             if approved:
                 censor_feedback = ""
+                # 执行智能体的结果已经在执行时立即返回给用户了
+                # 这里只需要记录任务状态，不需要再次返回结果
                 for subtask in subtasks:
                     agent_name = subtask.get("agent", "")
                     detail_message = detail_messages.get(agent_name)
                     if detail_message:
                         task_state.add_message(agent_name, "commander_agent", detail_message, task_id)
-                        yield (agent_name, "done", detail_message)
                 censor_approved_message = "审查通过：执行结果完整，允许向用户回奏。"
                 task_state.add_message("censor_agent", "秦始皇", censor_approved_message, task_id)
                 task_state.set_status("censor_agent", "done", task_id)

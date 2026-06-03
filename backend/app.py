@@ -7,6 +7,7 @@ import json
 import asyncio
 import logging
 import re
+import threading
 from contextlib import suppress
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -30,6 +31,7 @@ from src.agents.agents import (
     dataset_description_agent, chat_history_name_agent,
     chancellor_agent, censor_agent, commander_agent,
     qin_dynasty_orchestrator, AgentTaskState,
+    _run_sync,
 )
 from src.format_response import execution_succeeded, format_response_to_markdown, execute_code_from_markdown
 from src.runtime_config import (
@@ -64,10 +66,17 @@ STYLING_INSTRUCTIONS = [
 sessions: dict = {}
 task_states: dict = {}  # session_id -> AgentTaskState
 active_chat_runs: dict = {}  # session_id -> {run_id, cancel_event, task_state}
+session_locks: dict = {}  # session_id -> threading.Lock for thread-safe parallel uploads
 SESSION_STORAGE_DIR = Path(
     os.getenv("DATAPILOT_SESSION_DIR", Path(__file__).resolve().parent / ".datapilot_sessions")
 ).resolve()
 RESERVED_DATASET_NAMES = {"df", "raw_df", "df_clean", "df_cleaned"}
+
+def get_session_lock(session_id: str) -> threading.Lock:
+    """Get or create a lock for a session to ensure thread-safe operations."""
+    if session_id not in session_locks:
+        session_locks[session_id] = threading.Lock()
+    return session_locks[session_id]
 
 
 def _new_session() -> dict:
@@ -436,79 +445,83 @@ async def set_model_config(session_id: str, req: ModelConfigRequest):
 
 @app.post("/session/{session_id}/upload")
 async def upload_dataset(session_id: str, file: UploadFile = File(...), description: str = Form("")):
-    session = get_session(session_id)
-    filename = file.filename
-    ext = filename.rsplit(".", 1)[-1].lower()
+    session_lock = get_session_lock(session_id)
     
-    try:
-        content = await file.read()
-        if ext == "csv":
-            try:
-                decoded_content = content.decode("utf-8-sig")
-            except UnicodeDecodeError:
-                decoded_content = content.decode("gb18030")
-            df = pd.read_csv(StringIO(decoded_content))
-        elif ext in ("xlsx", "xls"):
-            df = pd.read_excel(BytesIO(content))
-        else:
-            raise HTTPException(400, f"不支持的文件格式: .{ext}")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(400, f"文件读取失败: {e}")
-    
-    # Store each upload independently and preserve its original filename.
-    dataset_name = _safe_dataset_name(filename, session["datasets"])
-    # Clear history when the available data collection changes so the LLM
-    # does not answer with stale assumptions from earlier files.
-    if session["datasets"]:
-        session["chat_history"] = []
-        task_states[session_id] = AgentTaskState()
-    session["datasets"][dataset_name] = df
-    session["dataset_files"][dataset_name] = filename
-    if not session.get("primary_dataset"):
-        session["primary_dataset"] = dataset_name
-    session["dataset_filename"] = filename
-    
-    # Generate description
-    session_lm = get_session_lm(session)
-    try:
-        with dspy.context(lm=session_lm):
-            desc_agent = dspy.Predict(dataset_description_agent)
+    # Acquire lock for thread-safe session access during parallel uploads
+    with session_lock:
+        session = get_session(session_id)
+        filename = file.filename
+        ext = filename.rsplit(".", 1)[-1].lower()
+        
+        try:
+            content = await file.read()
+            if ext == "csv":
+                try:
+                    decoded_content = content.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    decoded_content = content.decode("gb18030")
+                df = pd.read_csv(StringIO(decoded_content))
+            elif ext in ("xlsx", "xls"):
+                df = pd.read_excel(BytesIO(content))
+            else:
+                raise HTTPException(400, f"不支持的文件格式: .{ext}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(400, f"文件读取失败: {e}")
+        
+        # Store each upload independently and preserve its original filename.
+        dataset_name = _safe_dataset_name(filename, session["datasets"])
+        # Clear history when the available data collection changes so the LLM
+        # does not answer with stale assumptions from earlier files.
+        if session["datasets"]:
+            session["chat_history"] = []
+            task_states[session_id] = AgentTaskState()
+        session["datasets"][dataset_name] = df
+        session["dataset_files"][dataset_name] = filename
+        if not session.get("primary_dataset"):
+            session["primary_dataset"] = dataset_name
+        session["dataset_filename"] = filename
+        
+        # Generate description
+        session_lm = get_session_lm(session)
+        try:
+            with dspy.context(lm=session_lm):
+                desc_agent = dspy.Predict(dataset_description_agent)
+                buf = StringIO()
+                df.info(buf=buf)
+                info_str = buf.getvalue()
+                sample = df.head(5).to_string()
+                dataset_view = f"File: {filename}\nShape: {df.shape}\n\n{info_str}\n\nSample:\n{sample}"
+                # Only use user-provided description; otherwise empty string to prevent
+                # the LLM from "enhancing" old dataset descriptions.
+                existing_desc = description if description else ""
+                result = await asyncio.wait_for(
+                    _run_sync(
+                        desc_agent,
+                        dataset=dataset_view,
+                        existing_description=existing_desc,
+                    ),
+                    timeout=DATASET_DESCRIPTION_TIMEOUT_SECONDS,
+                )
+                session["dataset_descriptions"][dataset_name] = result.description
+        except Exception as e:
+            logger.warning(f"Dataset description generation failed: {e}; using fallback info().")
             buf = StringIO()
             df.info(buf=buf)
-            info_str = buf.getvalue()
-            sample = df.head(5).to_string()
-            dataset_view = f"File: {filename}\nShape: {df.shape}\n\n{info_str}\n\nSample:\n{sample}"
-            # Only use user-provided description; otherwise empty string to prevent
-            # the LLM from "enhancing" old dataset descriptions.
-            existing_desc = description if description else ""
-            result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    desc_agent,
-                    dataset=dataset_view,
-                    existing_description=existing_desc,
-                ),
-                timeout=DATASET_DESCRIPTION_TIMEOUT_SECONDS,
-            )
-            session["dataset_descriptions"][dataset_name] = result.description
-    except Exception as e:
-        logger.warning(f"Dataset description generation failed: {e}; using fallback info().")
-        buf = StringIO()
-        df.info(buf=buf)
-        session["dataset_descriptions"][dataset_name] = buf.getvalue()
+            session["dataset_descriptions"][dataset_name] = buf.getvalue()
 
-    _refresh_dataset_description(session)
-    persist_session(session_id, session)
-    
-    return {
-        "name": dataset_name,
-        "filename": filename,
-        "shape": list(df.shape),
-        "columns": list(df.columns),
-        "description": session["description"],
-        "datasets": _dataset_summaries(session),
-    }
+        _refresh_dataset_description(session)
+        persist_session(session_id, session)
+        
+        return {
+            "name": dataset_name,
+            "filename": filename,
+            "shape": list(df.shape),
+            "columns": list(df.columns),
+            "description": session["description"],
+            "datasets": _dataset_summaries(session),
+        }
 
 
 @app.get("/session/{session_id}/dataset")
@@ -569,7 +582,7 @@ async def describe_dataset(session_id: str, description: str = Form("")):
             buf = StringIO()
             df.info(buf=buf)
             result = await asyncio.wait_for(
-                asyncio.to_thread(
+                _run_sync(
                     desc_agent,
                     dataset=f"Shape: {df.shape}\n{buf.getvalue()}\n{df.head(5).to_string()}",
                     existing_description=description,
@@ -974,7 +987,7 @@ async def fix_code(session_id: str, req: CodeFixRequest):
         with dspy.context(lm=session_lm):
             fixer = dspy.Predict(code_fix)
             result = await asyncio.wait_for(
-                asyncio.to_thread(
+                _run_sync(
                     fixer,
                     dataset_context=session["description"],
                     faulty_code=req.code,
@@ -997,7 +1010,7 @@ async def edit_code(session_id: str, req: CodeEditRequest):
         with dspy.context(lm=session_lm):
             editor = dspy.Predict(code_edit)
             result = await asyncio.wait_for(
-                asyncio.to_thread(
+                _run_sync(
                     editor,
                     dataset_context=session["description"],
                     original_code=req.code,
@@ -1019,7 +1032,7 @@ async def chat_name(session_id: str, req: QueryRequest):
         with dspy.context(lm=session_lm):
             namer = dspy.Predict(chat_history_name_agent)
             result = await asyncio.wait_for(
-                asyncio.to_thread(namer, query=req.query),
+                _run_sync(namer, query=req.query),
                 timeout=HELPER_AGENT_TIMEOUT_SECONDS,
             )
             return {"name": result.name}

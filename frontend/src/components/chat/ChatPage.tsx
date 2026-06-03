@@ -718,7 +718,7 @@ export default function ChatPage() {
       const results = await Promise.all(uploadPromises)
       
       const uploaded = results.filter(r => r.success).map(r => r.name)
-      const failed = results.filter(r => !r.success).map(r => ({ name: r.name, error: r.error?.message }))
+      const failed = results.filter(r => !r.success).map(r => ({ name: r.name, error: (r as any).error?.message }))
       
       await refreshDatasets()
       setShowUpload(false)

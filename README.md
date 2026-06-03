@@ -74,9 +74,9 @@ npm run dev
    - 按 Enter 发送（Shift+Enter 换行）
    - 实时查看各智能体工作状态（左侧边栏）
 5. **查看结果**：
-   - Markdown 格式的分析报告
-   - 可执行 Python 代码（支持编辑 + 重新执行）
-   - 交互式 Plotly 图表
+   - Markdown 格式的分析回答
+   - 可执行的 Python 代码
+   - 交互式的 Plotly 图表
 
 ## ⚠️ 安全提示
 

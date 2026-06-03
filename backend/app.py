@@ -152,6 +152,36 @@ def _repair_dataset_metadata(session: dict):
     session["dataset_filename"] = dataset_files.get(primary, "")
 
 
+async def _generate_dataset_description(session: dict, dataset_name: str, df: pd.DataFrame, filename: str, description: str = ""):
+    """Generate description for a single dataset."""
+    session_lm = get_session_lm(session)
+    try:
+        with dspy.context(lm=session_lm):
+            desc_agent = dspy.Predict(dataset_description_agent)
+            buf = StringIO()
+            df.info(buf=buf)
+            info_str = buf.getvalue()
+            sample = df.head(5).to_string()
+            dataset_view = f"File: {filename}\nShape: {df.shape}\n\n{info_str}\n\nSample:\n{sample}"
+            # Only use user-provided description; otherwise empty string to prevent
+            # the LLM from "enhancing" old dataset descriptions.
+            existing_desc = description if description else ""
+            result = await asyncio.wait_for(
+                _run_sync(
+                    desc_agent,
+                    dataset=dataset_view,
+                    existing_description=existing_desc,
+                ),
+                timeout=DATASET_DESCRIPTION_TIMEOUT_SECONDS,
+            )
+            session["dataset_descriptions"][dataset_name] = result.description
+    except Exception as e:
+        logger.warning(f"Dataset description generation failed: {e}; using fallback info().")
+        buf = StringIO()
+        df.info(buf=buf)
+        session["dataset_descriptions"][dataset_name] = buf.getvalue()
+
+
 def _refresh_dataset_description(session: dict):
     """Build a multi-dataset context whose leading index always lists every file."""
     descriptions = session.get("dataset_descriptions", {})
@@ -453,6 +483,12 @@ async def upload_dataset(session_id: str, file: UploadFile = File(...), descript
         filename = file.filename
         ext = filename.rsplit(".", 1)[-1].lower()
         
+        # Clear history when the available data collection changes so the LLM
+        # does not answer with stale assumptions from earlier files.
+        if session["datasets"]:
+            session["chat_history"] = []
+            task_states[session_id] = AgentTaskState()
+        
         try:
             content = await file.read()
             if ext == "csv":
@@ -461,67 +497,114 @@ async def upload_dataset(session_id: str, file: UploadFile = File(...), descript
                 except UnicodeDecodeError:
                     decoded_content = content.decode("gb18030")
                 df = pd.read_csv(StringIO(decoded_content))
+                dataset_name = _safe_dataset_name(filename, session["datasets"])
+                session["datasets"][dataset_name] = df
+                session["dataset_files"][dataset_name] = filename
+                if not session.get("primary_dataset"):
+                    session["primary_dataset"] = dataset_name
+                session["dataset_filename"] = filename
+                
+                # Generate description for single dataset
+                await _generate_dataset_description(session, dataset_name, df, filename, description)
+                
+                _refresh_dataset_description(session)
+                persist_session(session_id, session)
+                
+                return {
+                    "name": dataset_name,
+                    "filename": filename,
+                    "shape": list(df.shape),
+                    "columns": list(df.columns),
+                    "description": session["description"],
+                    "datasets": _dataset_summaries(session),
+                }
+                
             elif ext in ("xlsx", "xls"):
-                df = pd.read_excel(BytesIO(content))
+                # Read all sheets from Excel file
+                excel_file = pd.ExcelFile(BytesIO(content))
+                sheet_names = excel_file.sheet_names
+                
+                if len(sheet_names) == 1:
+                    # Single sheet: use original logic
+                    df = pd.read_excel(BytesIO(content))
+                    dataset_name = _safe_dataset_name(filename, session["datasets"])
+                    session["datasets"][dataset_name] = df
+                    session["dataset_files"][dataset_name] = filename
+                    if not session.get("primary_dataset"):
+                        session["primary_dataset"] = dataset_name
+                    session["dataset_filename"] = filename
+                    
+                    # Generate description
+                    await _generate_dataset_description(session, dataset_name, df, filename, description)
+                    
+                    _refresh_dataset_description(session)
+                    persist_session(session_id, session)
+                    
+                    return {
+                        "name": dataset_name,
+                        "filename": filename,
+                        "shape": list(df.shape),
+                        "columns": list(df.columns),
+                        "description": session["description"],
+                        "datasets": _dataset_summaries(session),
+                    }
+                else:
+                    # Multiple sheets: create separate dataset for each sheet - processed in parallel
+                    sheet_info = []
+                    
+                    # Read all sheets in parallel
+                    async def read_sheet(sheet_name: str, content_bytes: bytes):
+                        df = await asyncio.to_thread(pd.read_excel, BytesIO(content_bytes), sheet_name=sheet_name)
+                        sheet_safe_name = re.sub(r"[^0-9a-zA-Z_]+", "_", sheet_name).strip("_") or f"sheet_{sheet_names.index(sheet_name)}"
+                        sheet_dataset_name = _safe_dataset_name(f"{Path(filename).stem}_{sheet_safe_name}", session["datasets"])
+                        return {
+                            "name": sheet_dataset_name,
+                            "sheet_name": sheet_name,
+                            "df": df,
+                        }
+                    
+                    # Parallel read all sheets
+                    read_tasks = [read_sheet(sheet_name, content) for sheet_name in sheet_names]
+                    sheet_info = await asyncio.gather(*read_tasks)
+                    
+                    # Store all datasets
+                    primary_df = None
+                    primary_dataset_name = None
+                    for info in sheet_info:
+                        session["datasets"][info["name"]] = info["df"]
+                        session["dataset_files"][info["name"]] = f"{filename}::{info['sheet_name']}"
+                        if primary_df is None:
+                            primary_df = info["df"]
+                            primary_dataset_name = info["name"]
+                    
+                    if not session.get("primary_dataset") and primary_dataset_name:
+                        session["primary_dataset"] = primary_dataset_name
+                    session["dataset_filename"] = filename
+                    
+                    # Generate descriptions in parallel
+                    desc_tasks = [
+                        _generate_dataset_description(session, info["name"], info["df"], f"{filename}::{info['sheet_name']}", description)
+                        for info in sheet_info
+                    ]
+                    await asyncio.gather(*desc_tasks)
+                    
+                    _refresh_dataset_description(session)
+                    persist_session(session_id, session)
+                    
+                    return {
+                        "name": primary_dataset_name,
+                        "filename": filename,
+                        "shape": list(primary_df.shape),
+                        "columns": list(primary_df.columns),
+                        "description": session["description"],
+                        "datasets": _dataset_summaries(session),
+                    }
             else:
                 raise HTTPException(400, f"不支持的文件格式: .{ext}")
         except HTTPException:
             raise
         except Exception as e:
             raise HTTPException(400, f"文件读取失败: {e}")
-        
-        # Store each upload independently and preserve its original filename.
-        dataset_name = _safe_dataset_name(filename, session["datasets"])
-        # Clear history when the available data collection changes so the LLM
-        # does not answer with stale assumptions from earlier files.
-        if session["datasets"]:
-            session["chat_history"] = []
-            task_states[session_id] = AgentTaskState()
-        session["datasets"][dataset_name] = df
-        session["dataset_files"][dataset_name] = filename
-        if not session.get("primary_dataset"):
-            session["primary_dataset"] = dataset_name
-        session["dataset_filename"] = filename
-        
-        # Generate description
-        session_lm = get_session_lm(session)
-        try:
-            with dspy.context(lm=session_lm):
-                desc_agent = dspy.Predict(dataset_description_agent)
-                buf = StringIO()
-                df.info(buf=buf)
-                info_str = buf.getvalue()
-                sample = df.head(5).to_string()
-                dataset_view = f"File: {filename}\nShape: {df.shape}\n\n{info_str}\n\nSample:\n{sample}"
-                # Only use user-provided description; otherwise empty string to prevent
-                # the LLM from "enhancing" old dataset descriptions.
-                existing_desc = description if description else ""
-                result = await asyncio.wait_for(
-                    _run_sync(
-                        desc_agent,
-                        dataset=dataset_view,
-                        existing_description=existing_desc,
-                    ),
-                    timeout=DATASET_DESCRIPTION_TIMEOUT_SECONDS,
-                )
-                session["dataset_descriptions"][dataset_name] = result.description
-        except Exception as e:
-            logger.warning(f"Dataset description generation failed: {e}; using fallback info().")
-            buf = StringIO()
-            df.info(buf=buf)
-            session["dataset_descriptions"][dataset_name] = buf.getvalue()
-
-        _refresh_dataset_description(session)
-        persist_session(session_id, session)
-        
-        return {
-            "name": dataset_name,
-            "filename": filename,
-            "shape": list(df.shape),
-            "columns": list(df.columns),
-            "description": session["description"],
-            "datasets": _dataset_summaries(session),
-        }
 
 
 @app.get("/session/{session_id}/dataset")
@@ -562,6 +645,151 @@ async def delete_dataset(session_id: str, dataset_name: str):
         "status": "deleted",
         "loaded": bool(session["datasets"]),
         "datasets": _dataset_summaries(session),
+    }
+
+
+@app.post("/session/{session_id}/upload/batch")
+async def upload_dataset_batch(session_id: str, files: list[UploadFile] = File(...)):
+    """批量上传多个文件，并行处理"""
+    session_lock = get_session_lock(session_id)
+    
+    with session_lock:
+        session = get_session(session_id)
+        
+        # Clear history when the available data collection changes
+        if session["datasets"]:
+            session["chat_history"] = []
+            task_states[session_id] = AgentTaskState()
+    
+    results = []
+    errors = []
+    
+    # 定义单个文件处理函数
+    async def process_file(file: UploadFile):
+        filename = file.filename
+        ext = filename.rsplit(".", 1)[-1].lower() if filename else ""
+        
+        try:
+            content = await file.read()
+            
+            if ext == "csv":
+                try:
+                    decoded_content = content.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    decoded_content = content.decode("gb18030")
+                df = pd.read_csv(StringIO(decoded_content))
+                
+                dataset_name = _safe_dataset_name(filename, {})
+                return {
+                    "type": "single",
+                    "filename": filename,
+                    "dataset_name": dataset_name,
+                    "df": df,
+                }
+            
+            elif ext in ("xlsx", "xls"):
+                excel_file = pd.ExcelFile(BytesIO(content))
+                sheet_names = excel_file.sheet_names
+                
+                if len(sheet_names) == 1:
+                    df = pd.read_excel(BytesIO(content))
+                    dataset_name = _safe_dataset_name(filename, {})
+                    return {
+                        "type": "single",
+                        "filename": filename,
+                        "dataset_name": dataset_name,
+                        "df": df,
+                    }
+                else:
+                    sheets = []
+                    for sheet_name in sheet_names:
+                        df = pd.read_excel(BytesIO(content), sheet_name=sheet_name)
+                        sheet_safe_name = re.sub(r"[^0-9a-zA-Z_]+", "_", sheet_name).strip("_") or f"sheet_{sheet_names.index(sheet_name)}"
+                        sheet_dataset_name = _safe_dataset_name(f"{Path(filename).stem}_{sheet_safe_name}", {})
+                        sheets.append({
+                            "sheet_name": sheet_name,
+                            "dataset_name": sheet_dataset_name,
+                            "df": df,
+                        })
+                    return {
+                        "type": "multi",
+                        "filename": filename,
+                        "sheets": sheets,
+                    }
+            else:
+                return {"type": "error", "filename": filename, "error": f"不支持的文件格式: .{ext}"}
+                
+        except Exception as e:
+            return {"type": "error", "filename": filename, "error": f"文件读取失败: {e}"}
+    
+    # 并行读取所有文件
+    process_tasks = [process_file(file) for file in files]
+    processed_results = await asyncio.gather(*process_tasks)
+    
+    # 获取所有数据集名称用于安全命名
+    with session_lock:
+        existing_names = set(session["datasets"].keys())
+    
+    # 收集所有要存储的数据集
+    all_datasets = []
+    primary_df = None
+    primary_dataset_name = None
+    
+    for result in processed_results:
+        if result["type"] == "error":
+            errors.append({"filename": result["filename"], "error": result["error"]})
+        elif result["type"] == "single":
+            safe_name = _safe_dataset_name(result["filename"], existing_names)
+            existing_names.add(safe_name)
+            all_datasets.append({
+                "name": safe_name,
+                "filename": result["filename"],
+                "df": result["df"],
+            })
+            if primary_df is None:
+                primary_df = result["df"]
+                primary_dataset_name = safe_name
+        elif result["type"] == "multi":
+            for sheet in result["sheets"]:
+                safe_name = _safe_dataset_name(f"{Path(result['filename']).stem}_{sheet['sheet_name']}", existing_names)
+                existing_names.add(safe_name)
+                all_datasets.append({
+                    "name": safe_name,
+                    "filename": f"{result['filename']}::{sheet['sheet_name']}",
+                    "df": sheet["df"],
+                })
+                if primary_df is None:
+                    primary_df = sheet["df"]
+                    primary_dataset_name = safe_name
+    
+    # 存储所有数据集
+    with session_lock:
+        for ds in all_datasets:
+            session["datasets"][ds["name"]] = ds["df"]
+            session["dataset_files"][ds["name"]] = ds["filename"]
+        
+        if not session.get("primary_dataset") and primary_dataset_name:
+            session["primary_dataset"] = primary_dataset_name
+        if all_datasets:
+            session["dataset_filename"] = all_datasets[0]["filename"]
+        
+        # 并行生成所有描述
+        desc_tasks = [
+            _generate_dataset_description(session, ds["name"], ds["df"], ds["filename"], "")
+            for ds in all_datasets
+        ]
+        await asyncio.gather(*desc_tasks)
+        
+        _refresh_dataset_description(session)
+        persist_session(session_id, session)
+        
+        results = [{"name": ds["name"], "filename": ds["filename"], "shape": list(ds["df"].shape)} for ds in all_datasets]
+    
+    return {
+        "results": results,
+        "errors": errors,
+        "datasets": _dataset_summaries(session),
+        "description": session["description"],
     }
 
 
@@ -920,19 +1148,20 @@ async def chat_with_planner_legacy(session_id: str, req: QueryRequest):
                 {"analytical_planner": plan_response}, _execution_datasets(session)
             )
 
-            yield json.dumps({"agent": "Analytical Planner", "content": plan_desc, "status": "success"}) + "\n"
+            yield json.dumps({"type": "agent_status", "agent": "Analytical Planner", "content": plan_desc, "status": "success"}) + "\n"
 
             if ai_system:
                 with dspy.context(lm=session_lm):
                     async for agent_name, inputs, response in ai_system.execute_plan(req.query, plan_response):
                         if agent_name in ("plan_not_found", "plan_not_formatted_correctly"):
-                            yield json.dumps({"agent": "Planner", "content": f"**Error**: {agent_name}", "status": "error"}) + "\n"
+                            yield json.dumps({"type": "error", "agent": "Planner", "content": f"**Error**: {agent_name}", "status": "error"}) + "\n"
                             return
 
                         formatted = format_response_to_markdown(
                             {agent_name: response}, _execution_datasets(session)
                         )
                         yield json.dumps({
+                            "type": "agent_status",
                             "agent": agent_name.split("__")[0] if "__" in agent_name else agent_name,
                             "content": formatted,
                             "status": "success" if response else "error",
@@ -941,10 +1170,10 @@ async def chat_with_planner_legacy(session_id: str, req: QueryRequest):
             session["chat_history"].append({"role": "user", "content": req.query})
 
         except asyncio.TimeoutError:
-            yield json.dumps({"agent": "Planner", "content": "Request timed out.", "status": "error"}) + "\n"
+            yield json.dumps({"type": "error", "agent": "Planner", "content": "Request timed out.", "status": "error"}) + "\n"
         except Exception as e:
             logger.error(f"Planner stream error: {e}")
-            yield json.dumps({"agent": "Planner", "content": f"Error: {str(e)}", "status": "error"}) + "\n"
+            yield json.dumps({"type": "error", "agent": "Planner", "content": f"Error: {str(e)}", "status": "error"}) + "\n"
 
     return StreamingResponse(
         stream(),

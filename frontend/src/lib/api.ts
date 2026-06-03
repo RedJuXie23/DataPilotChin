@@ -158,6 +158,20 @@ export interface UploadResult {
   datasets: DatasetSummary[];
 }
 
+export interface BatchUploadResult {
+  results: Array<{
+    name: string;
+    filename: string;
+    shape: number[];
+  }>;
+  errors: Array<{
+    filename: string;
+    error: string;
+  }>;
+  datasets: DatasetSummary[];
+  description: string;
+}
+
 export async function uploadDataset(sessionId: string, file: File, description: string = ''): Promise<UploadResult> {
   const form = new FormData();
   form.append('file', file);
@@ -170,6 +184,23 @@ export async function uploadDataset(sessionId: string, file: File, description: 
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: '上传失败' }));
     throw new Error(err.detail || '上传失败');
+  }
+  return res.json();
+}
+
+export async function uploadDatasetsBatch(sessionId: string, files: File[]): Promise<BatchUploadResult> {
+  const form = new FormData();
+  files.forEach(file => {
+    form.append('files', file);
+  });
+  
+  const res = await fetch(`${API_BASE}/session/${sessionId}/upload/batch`, {
+    method: 'POST',
+    body: form,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: '批量上传失败' }));
+    throw new Error(err.detail || '批量上传失败');
   }
   return res.json();
 }

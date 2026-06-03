@@ -8,7 +8,7 @@ import { useTheme } from '@/components/ThemeProvider'
 // Dynamically import react-plotly.js to avoid SSR issues
 const Plot = dynamic(() => import('react-plotly.js'), { ssr: false })
 import {
-  createSession, uploadDataset, getDatasetInfo,
+  createSession, uploadDataset, uploadDatasetsBatch, getDatasetInfo,
   getModelConfig, setModelConfig, getAgents, getAgentsStatus,
   chatWithAgent, chatWithPlanner, fixCode, executeCode, stopChat, deleteDataset,
   type Agent, type ChatMessage, type ModelConfig, type DatasetInfo,
@@ -16,10 +16,9 @@ import {
 
 // Helper to extract code blocks from markdown
 function extractCodeFromMarkdown(markdown: string): string | null {
-  const codeBlockMatch = markdown.match(/```python\s*\n([\s\S]*?)```/);
-  if (codeBlockMatch) return codeBlockMatch[1].trim();
-  const genericCodeMatch = markdown.match(/```\s*\n([\s\S]*?)```/);
-  if (genericCodeMatch) return genericCodeMatch[1].trim();
+  // 匹配：以 ```python 开头
+  const pythonCodeMatch = markdown.match(/```python([\s\S]*)/);
+  if (pythonCodeMatch) return pythonCodeMatch[1].trim();
   return null;
 }
 
@@ -572,6 +571,26 @@ export default function ChatPage() {
           }
         } else if (event.type === 'stopped') {
           setLoading(false)
+        } else if (event.type === 'final' && event.status === 'success') {
+          // 处理成功的最终结果
+          if (event.content && typeof event.content === 'string') {
+            setMessages(prev => {
+              const assistantMsg: ChatMessage = {
+                id: `final-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+                role: 'assistant',
+                content: event.content,
+                agent: 'assistant',
+                timestamp: Date.now(),
+              }
+              const updated = [...prev, assistantMsg]
+              setSessions(prevSessions =>
+                prevSessions.map(s =>
+                  s.id === currentSessionId ? { ...s, messages: updated } : s
+                )
+              )
+              return updated
+            })
+          }
         } else if (event.type === 'error' || (event.type === 'final' && event.status !== 'success')) {
           const errorContent = typeof event.content === 'string'
             ? event.content
@@ -708,17 +727,11 @@ export default function ChatPage() {
     if (!currentSessionId || files.length === 0) return
     
     try {
-      // 并行上传所有文件
-      const uploadPromises = files.map(file => 
-        uploadDataset(currentSessionId, file)
-          .then(result => ({ success: true, name: file.name, result }))
-          .catch(error => ({ success: false, name: file.name, error }))
-      )
+      // 使用批量上传接口实现真正的并行上传
+      const result = await uploadDatasetsBatch(currentSessionId, files)
       
-      const results = await Promise.all(uploadPromises)
-      
-      const uploaded = results.filter(r => r.success).map(r => r.name)
-      const failed = results.filter(r => !r.success).map(r => ({ name: r.name, error: (r as any).error?.message }))
+      const uploaded = result.results.map(r => r.name)
+      const failed = result.errors
       
       await refreshDatasets()
       setShowUpload(false)
@@ -733,7 +746,7 @@ export default function ChatPage() {
       }
       
       if (failed.length > 0) {
-        const errorMsg = failed.map(f => `${f.name}: ${f.error || '未知错误'}`).join('；')
+        const errorMsg = failed.map(f => `${f.filename}: ${f.error || '未知错误'}`).join('；')
         setMessages(prev => [...prev, {
           id: Date.now().toString(),
           role: 'system',
@@ -1301,7 +1314,7 @@ export default function ChatPage() {
               <div className="mt-4 border-t border-[var(--border)] pt-4">
                 <h4 className="text-sm font-semibold mb-2">📤 输出</h4>
                 <div className="bg-[var(--bg-tertiary)] border border-[var(--border)] rounded-lg p-4 max-h-[200px] overflow-y-auto text-sm">
-                  <ReactMarkdown>{codeOutput}</ReactMarkdown>
+                  <MessageContent content={codeOutput} />
                 </div>
               </div>
             )}

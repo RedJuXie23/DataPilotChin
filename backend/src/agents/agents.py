@@ -262,14 +262,21 @@ For ordinary conversation, follow-up questions about prior work, explanations, g
 or requests that do not require new data computation, return:
 {"mode":"chat","response":"answer in the user's language","subtasks":[]}
 Answer from the provided context. Do not dispatch executors just to restate or explain prior work.
+Exception: if the user asks to rerun, re-execute, repeat, or run the previous task again,
+return mode="execute" and reconstruct the prior executable subtasks from conversation_history.
 
 For requests that require new data computation, cleaning, modeling, or visualization, return:
-{"mode":"execute","task_id":"...","user_goal":"...","refined_goal":"...","subtasks":[...]}
+{"mode":"execute","task_id":"...","user_goal":"...","refined_goal":"...","report_requested":true|false,"subtasks":[...]}
 Each execution subtask must contain agent and instruction. Use the fewest necessary executors:
 preprocessing_agent, statistical_analytics_agent, sk_learn_agent, or data_viz_agent.
 Choose data_viz_agent only when a chart is requested or materially useful. For a
 visualization, require Plotly, the filename-derived dataset variables listed in the
 dataset description, and fig.show(). Do not execute code.
+
+Set report_requested=true only when the user explicitly asks for a report, analysis report,
+written report, document, or a rich text-and-chart summary. If report_requested=true, include
+data_viz_agent unless the plan already has visualization work. If report_requested=false, do
+not generate a final report; executor results are enough.
 """
 
 censor_agent.instructions = """
@@ -735,29 +742,183 @@ class qin_dynasty_orchestrator(dspy.Module):
     def _default_subtasks(self, query):
         return self._infer_subtasks(query)
 
-    def _looks_like_execution_request(self, query):
-        """Fast-path explicit analytics requests without spending an LLM routing call."""
-        normalized = query.lower()
-        follow_up_terms = (
-            "刚才", "刚刚", "之前", "上一次", "你做了什么", "解释一下", "为什么",
-            "什么是", "是什么", "怎么理解", "介绍一下", "不要执行", "不用执行",
-            "不需要分析", "不要分析", "聊天", "对话", "what did", "previous",
-            "what is", "explain", "just chat", "do not execute",
+    def _clean_user_query(self, query):
+        return str(query or "").partition(" | ts=")[0].strip().lower()
+
+    def _contains_any(self, text, terms):
+        return any(term in text for term in terms)
+
+    def _matches_any(self, text, patterns):
+        return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+
+    def _is_report_requested(self, query):
+        normalized = self._clean_user_query(query)
+        negative_terms = (
+            "不要报告", "不用报告", "不生成报告", "无需报告", "别生成报告",
+            "no report", "do not generate a report", "don't generate a report",
         )
-        if any(term in normalized for term in follow_up_terms):
+        if any(term in normalized for term in negative_terms):
             return False
-        execution_terms = (
-            "预处理", "清洗", "缺失值", "异常值", "统计", "相关性", "描述性", "分析",
-            "建模", "模型", "机器学习", "预测", "回归", "分类", "聚类", "可视化",
-            "画图", "绘图", "图表", "plot", "chart", "graph", "visual", "analyze",
-            "analysis", "clean", "preprocess", "model", "predict", "forecast", "regression",
-            "classification", "cluster", "correlation", "statistics",
+        report_explanation_terms = (
+            "报告怎么写", "报告如何写", "报告格式", "报告模板", "怎么写报告", "如何写报告",
+            "how to write a report", "report format", "report template",
         )
-        return any(term in normalized for term in execution_terms)
+        if self._contains_any(normalized, report_explanation_terms):
+            return False
+        report_patterns = (
+            r"(生成|输出|出|写|整理|给我|要|需要).{0,12}(报告|分析报告|总结报告|研究报告|文档)",
+            r"(报告|分析报告|总结报告|研究报告|文档).{0,12}(生成|输出|写|整理|图文并茂)",
+            r"图文并茂",
+            r"(generate|write|create|produce).{0,24}(report|analysis report|written report|document)",
+            r"(report|analysis report|written report|document).{0,24}(with charts|rich|visual|figure)",
+        )
+        return self._matches_any(normalized, report_patterns)
+
+    def _is_rerun_request(self, query):
+        normalized = self._clean_user_query(query)
+        rerun_terms = (
+            "再次执行", "重新执行", "再执行", "重跑", "再跑", "再跑一遍",
+            "重新跑", "再做一遍", "重做", "复现上次", "重复执行",
+            "执行之前的任务", "执行刚才的任务", "执行上一轮任务", "按照之前的任务再来",
+            "rerun", "re-run", "run again", "execute again", "repeat the previous task",
+        )
+        return self._contains_any(normalized, rerun_terms)
+
+    def _subtasks_from_conversation_context(self, conversation_history):
+        try:
+            context = json.loads(str(conversation_history or "{}"))
+        except Exception:
+            return []
+
+        records = []
+        records.extend(context.get("all_task_history", []) or [])
+        records.extend(context.get("all_agent_messages", []) or [])
+
+        for record in reversed(records):
+            raw = record.get("result", record.get("content", ""))
+            if "subtasks" not in str(raw):
+                continue
+            try:
+                parsed = parse_json_object(raw, "previous task context")
+            except Exception:
+                continue
+            subtasks = parsed.get("subtasks", [])
+            if isinstance(subtasks, list) and subtasks:
+                normalized = self._normalize_subtasks(subtasks, "rerun previous task")
+                if normalized:
+                    return normalized
+        return []
+
+    def _is_conversation_only_request(self, query):
+        """Detect requests that should not start executor agents."""
+        normalized = self._clean_user_query(query)
+        if self._is_rerun_request(normalized):
+            return False
+        do_not_execute_terms = (
+            "不要执行", "不用执行", "不要分析数据", "不用分析数据", "不需要分析",
+            "不要跑代码", "不用跑代码", "不要调用智能体", "只聊天", "直接回答",
+            "do not execute", "don't execute", "do not run code", "just chat",
+        )
+        if self._contains_any(normalized, do_not_execute_terms):
+            return True
+
+        explanation_terms = (
+            "什么是", "是什么", "解释", "介绍", "说明", "怎么理解", "为什么",
+            "怎么写", "如何写", "格式", "模板", "区别", "原理", "含义", "定义", "刚才", "刚刚", "之前", "上一轮",
+            "上一次", "你做了什么", "what is", "explain", "describe", "why",
+            "difference", "definition", "previous", "what did",
+        )
+        explicit_execution_patterns = (
+            r"(分析|统计|建模|预测|清洗|预处理|画图|绘图|可视化).{0,12}(数据|数据集|文件|表格)",
+            r"(帮我|请|开始|进行|执行|生成|输出|做|给我).{0,16}(分析|统计|建模|预测|清洗|预处理|可视化|图表|报告)",
+            r"(analyze|analyse|clean|preprocess|model|predict|forecast|plot|chart|visualize).{0,24}(data|dataset|file|table)",
+        )
+        return self._contains_any(normalized, explanation_terms) and not self._matches_any(normalized, explicit_execution_patterns)
+
+    def _looks_like_execution_request(self, query):
+        """Fast-path only explicit analytics requests; ambiguous text goes to the chancellor LLM."""
+        normalized = self._clean_user_query(query)
+        if self._is_rerun_request(normalized):
+            return False
+        if self._is_conversation_only_request(normalized):
+            return False
+
+        explicit_patterns = (
+            r"(分析|统计|建模|预测|清洗|预处理|画图|绘图|可视化).{0,12}(数据|数据集|文件|表格|样本|变量|字段)",
+            r"(数据|数据集|文件|表格|样本|变量|字段).{0,12}(分析|统计|建模|预测|清洗|预处理|画图|绘图|可视化)",
+            r"(帮我|请|开始|进行|执行|做|给我).{0,16}(分析|统计|建模|预测|清洗|预处理|可视化|图表)",
+            r"(analyze|analyse|clean|preprocess|model|predict|forecast|plot|chart|visualize).{0,24}(data|dataset|file|table)",
+        )
+        single_intent_terms = (
+            "清洗数据", "预处理数据", "缺失值处理", "异常值处理", "训练模型",
+            "机器学习建模", "做回归", "做分类", "做聚类", "画图", "绘图",
+            "生成图表", "可视化", "analyze data", "clean data", "train model",
+            "make a chart", "plot the data",
+        )
+        return (
+            self._is_report_requested(normalized)
+            or self._matches_any(normalized, explicit_patterns)
+            or self._contains_any(normalized, single_intent_terms)
+        )
+
+    def _requested_executor_intents(self, query):
+        normalized = self._clean_user_query(query)
+        return {
+            "preprocessing_agent": self._contains_any(
+                normalized,
+                ("预处理", "清洗", "缺失值", "异常值", "编码", "clean", "preprocess", "missing", "outlier"),
+            ),
+            "statistical_analytics_agent": self._contains_any(
+                normalized,
+                ("统计", "相关性", "描述性", "分布", "均值", "方差", "分析", "statistics", "correlation", "analysis", "analyze"),
+            ) or self._is_report_requested(normalized),
+            "sk_learn_agent": self._contains_any(
+                normalized,
+                ("建模", "模型训练", "机器学习", "预测", "回归", "分类", "聚类", "model", "predict", "forecast", "regression", "classification", "cluster"),
+            ),
+            "data_viz_agent": self._contains_any(
+                normalized,
+                ("可视化", "画图", "绘图", "图表", "plot", "chart", "graph", "visual", "figure"),
+            ) or self._is_report_requested(normalized),
+        }
+
+    def _filter_subtasks_by_user_intent(self, subtasks, query):
+        """Drop clearly unrelated executor assignments from model-generated plans."""
+        if not subtasks:
+            return subtasks
+        if self._is_rerun_request(query):
+            return subtasks
+
+        intents = self._requested_executor_intents(query)
+        filtered = []
+        for subtask in subtasks:
+            agent = subtask.get("agent", "")
+            if agent == "preprocessing_agent" and not (intents["preprocessing_agent"] or intents["sk_learn_agent"]):
+                continue
+            if agent == "statistical_analytics_agent" and not (
+                intents["statistical_analytics_agent"] or intents["sk_learn_agent"] or self._is_report_requested(query)
+            ):
+                continue
+            if agent == "sk_learn_agent" and not intents["sk_learn_agent"]:
+                continue
+            if agent == "data_viz_agent" and not intents["data_viz_agent"]:
+                continue
+            filtered.append(subtask)
+
+        if filtered:
+            return filtered
+        if self._looks_like_execution_request(query):
+            return [{
+                "agent": "statistical_analytics_agent",
+                "instruction": "使用执行上下文中列出的真实数据集变量完成用户要求的数据分析。",
+            }]
+        return []
 
     def _infer_subtasks(self, query):
         """Build a conservative ordered fallback plan for explicit analytics requests."""
-        normalized = query.lower()
+        normalized = self._clean_user_query(query)
+        if self._is_conversation_only_request(normalized):
+            return []
         groups = [
             (
                 "preprocessing_agent",
@@ -785,6 +946,15 @@ class qin_dynasty_orchestrator(dspy.Module):
             for agent, terms, instruction in groups
             if any(term in normalized for term in terms)
         ]
+        subtasks = self._filter_subtasks_by_user_intent(subtasks, query)
+        if self._is_report_requested(query) and not any(item["agent"] == "data_viz_agent" for item in subtasks):
+            subtasks.append({
+                "agent": "data_viz_agent",
+                "instruction": (
+                    "使用 Plotly 基于执行上下文中的真实数据变量和已完成分析结果，生成适合分析报告使用的关键图表。"
+                    "至少输出一张能支撑结论的交互式图表，并调用 fig.show(renderer='json')。"
+                ),
+            })
         return subtasks or [{
             "agent": "statistical_analytics_agent",
             "instruction": "使用执行上下文中列出的真实数据集变量完成用户要求的数据分析。",
@@ -793,16 +963,47 @@ class qin_dynasty_orchestrator(dspy.Module):
     async def _route_with_chancellor(self, **kwargs):
         """Use deterministic routing for explicit work and the LLM for conversation."""
         instruction = str(kwargs.get("user_instruction", ""))
+        if self._is_rerun_request(instruction):
+            display_instruction = instruction.partition(" | ts=")[0]
+            previous_subtasks = self._subtasks_from_conversation_context(kwargs.get("conversation_history", ""))
+            if previous_subtasks:
+                task = {
+                    "mode": "execute",
+                    "user_goal": display_instruction,
+                    "refined_goal": "再次执行上一轮可执行任务",
+                    "report_requested": self._is_report_requested(display_instruction),
+                    "subtasks": previous_subtasks,
+                }
+                return types.SimpleNamespace(refined_task=json.dumps(task, ensure_ascii=False))
+            return types.SimpleNamespace(refined_task=json.dumps({
+                "mode": "chat",
+                "response": "我没有找到可复用的上一轮执行任务。请重新描述要执行的数据分析任务。",
+                "subtasks": [],
+            }, ensure_ascii=False))
         if self._looks_like_execution_request(instruction):
             display_instruction = instruction.partition(" | ts=")[0]
             task = {
                 "mode": "execute",
                 "user_goal": display_instruction,
                 "refined_goal": display_instruction,
+                "report_requested": self._is_report_requested(display_instruction),
                 "subtasks": self._infer_subtasks(display_instruction),
             }
             return types.SimpleNamespace(refined_task=json.dumps(task, ensure_ascii=False))
         return await self._chancellor_predict(**kwargs)
+
+    def _ensure_report_visualization_subtask(self, subtasks, query):
+        if not self._is_report_requested(query):
+            return subtasks
+        if any(subtask.get("agent") == "data_viz_agent" for subtask in subtasks):
+            return subtasks
+        return subtasks + [{
+            "agent": "data_viz_agent",
+            "instruction": (
+                "使用 Plotly 基于执行上下文中的真实数据变量和已完成分析结果，生成适合分析报告使用的关键图表。"
+                "至少输出一张能支撑结论的交互式图表，并调用 fig.show(renderer='json')。"
+            ),
+        }]
 
     def _normalize_subtasks(self, subtasks, query):
         """Validate planner output and merge duplicate assignments to the same executor."""
@@ -824,7 +1025,9 @@ class qin_dynasty_orchestrator(dspy.Module):
             else:
                 merged[agent] = {"agent": agent, "instruction": instruction.strip()}
 
-        return list(merged.values()) or self._default_subtasks(query)
+        normalized = list(merged.values())
+        normalized = self._filter_subtasks_by_user_intent(normalized, query)
+        return normalized or self._default_subtasks(query)
 
     def _compact_display_text(self, text, fallback=""):
         """Remove timestamps and repeated LLM paragraphs from user-facing summaries."""
@@ -1050,6 +1253,82 @@ class qin_dynasty_orchestrator(dspy.Module):
         dataset_index, details = description.split(details_marker, 1)
         details_budget = max(0, 12000 - len(dataset_index) - len(details_marker))
         return dataset_index + details_marker + details[:details_budget]
+
+    def _strip_plotly_payloads(self, text):
+        return re.sub(
+            r"<<<PLOTLY_JSON>>>.*?<<<END_PLOTLY_JSON>>>",
+            "[交互式图表见下方]",
+            str(text or ""),
+            flags=re.DOTALL,
+        ).strip()
+
+    def _extract_plotly_payloads(self, executor_results):
+        charts = []
+        seen = set()
+        for result in executor_results.values():
+            if not isinstance(result, dict):
+                continue
+            for source in (result.get("result", ""), result.get("summary", "")):
+                for match in re.finditer(
+                    r"<<<PLOTLY_JSON>>>\n([\s\S]*?)\n<<<END_PLOTLY_JSON>>>",
+                    str(source or ""),
+                ):
+                    payload = match.group(1).strip()
+                    if payload and payload not in seen:
+                        seen.add(payload)
+                        charts.append(payload)
+        return charts
+
+    def _build_analysis_report(self, query, refined_task, execution_plan, executor_results):
+        goal = self._compact_display_text(refined_task.get("refined_goal"), query)
+        report = [
+            "# 数据分析报告",
+            "",
+            f"## 分析目标\n\n{goal}",
+            "",
+            "## 方法与分工",
+            "",
+        ]
+
+        subtasks = execution_plan.get("subtasks", []) or refined_task.get("subtasks", [])
+        if subtasks:
+            for index, subtask in enumerate(subtasks, 1):
+                agent = subtask.get("agent", "unknown_agent")
+                instruction = self._compact_display_text(subtask.get("instruction", ""), "")
+                report.append(f"{index}. **{agent}**：{instruction}")
+        else:
+            report.append("本次任务由丞相直接汇总既有执行结果。")
+
+        report.extend(["", "## 关键发现", ""])
+        has_findings = False
+        for agent_name, result in executor_results.items():
+            if not isinstance(result, dict):
+                continue
+            summary = self._strip_plotly_payloads(result.get("summary", ""))
+            run_result = self._strip_plotly_payloads(result.get("result", ""))
+            if summary:
+                report.append(f"### {agent_name}\n\n{summary}")
+                has_findings = True
+            if run_result:
+                report.append(f"**运行结果摘要**\n\n{run_result[:3000]}")
+                has_findings = True
+        if not has_findings:
+            report.append("暂无可汇总的结构化发现。")
+
+        charts = self._extract_plotly_payloads(executor_results)
+        if charts:
+            report.extend(["", "## 图表", ""])
+            for index, chart in enumerate(charts, 1):
+                report.append(f"### 图 {index}")
+                report.append(f"<<<PLOTLY_JSON>>>\n{chart}\n<<<END_PLOTLY_JSON>>>")
+
+        report.extend([
+            "",
+            "## 结论",
+            "",
+            "以上结论基于当前上传数据、执行代码结果和御史大夫审核通过的智能体输出生成。",
+        ])
+        return "\n\n".join(part for part in report if part is not None).strip()
     
     async def execute_user_query(self, query, session_lm, task_state: AgentTaskState, datasets: dict, chat_history=None, stop_flag=None):
         """执行用户查询的完整流程（SSE 生成器）。
@@ -1117,6 +1396,18 @@ class qin_dynasty_orchestrator(dspy.Module):
                     yield ("chancellor_agent", "done", direct_response)
                     yield ("final", "done", {"mode": "chat", "response": direct_response})
                     return
+                if self._is_conversation_only_request(query):
+                    direct_response = (
+                        "这是解释、追问或明确不执行的对话请求，我不会启动后续数据分析智能体。"
+                        "请直接说明你想了解的概念或上一轮结果中的哪一部分。"
+                    )
+                    task_state.set_status("chancellor_agent", "done", task_id)
+                    task_state.add_message("秦始皇", "chancellor_agent", query, task_id)
+                    task_state.add_message("chancellor_agent", "秦始皇", direct_response, task_id, "direct_response")
+                    task_state.add_history("chancellor_agent", "执行保护：转为直接对话", direct_response, task_id)
+                    yield ("chancellor_agent", "done", direct_response)
+                    yield ("final", "done", {"mode": "chat", "response": direct_response})
+                    return
                 # 确保 subtasks 存在，如果不存在则创建一个
                 if 'subtasks' not in refined_task:
                     refined_task['subtasks'] = []
@@ -1124,16 +1415,19 @@ class qin_dynasty_orchestrator(dspy.Module):
                 if len(refined_task.get('subtasks', [])) == 0:
                     logger.warning(f"丞相生成的 subtasks 为空，添加默认任务")
                     refined_task['subtasks'] = self._default_subtasks(query_with_timestamp)
+                refined_task["report_requested"] = self._is_report_requested(query)
             except (json.JSONDecodeError, TypeError) as e:
                 logger.warning(f"丞相返回的细化任务解析失败: {e}, 原始输出: {refined_task_str[:500]}")
                 refined_task = {
                     "task_id": task_id,
                     "user_goal": query_with_timestamp,  # 使用带时间戳的查询
                     "refined_goal": refined_task_str,
+                    "report_requested": self._is_report_requested(query),
                     "subtasks": self._default_subtasks(query_with_timestamp)
                 }
 
             refined_task["subtasks"] = self._normalize_subtasks(refined_task.get("subtasks"), query_with_timestamp)
+            refined_task["subtasks"] = self._ensure_report_visualization_subtask(refined_task["subtasks"], query)
             refined_task_str = json.dumps(refined_task, ensure_ascii=False)
             
             task_state.set_status("chancellor_agent", "done", task_id)
@@ -1219,6 +1513,7 @@ class qin_dynasty_orchestrator(dspy.Module):
                 execution_plan = {"subtasks": chancellor_subtasks or self._default_subtasks(query_with_timestamp)}
 
             execution_plan["subtasks"] = self._normalize_subtasks(execution_plan.get("subtasks"), query_with_timestamp)
+            execution_plan["subtasks"] = self._ensure_report_visualization_subtask(execution_plan["subtasks"], query)
             execution_plan_str = json.dumps(execution_plan, ensure_ascii=False)
             
             task_state.set_status("commander_agent", "working", task_id)
@@ -1642,6 +1937,14 @@ class qin_dynasty_orchestrator(dspy.Module):
             return
 
         final_result = executor_results
+        if bool(refined_task.get("report_requested", False)):
+            report = self._build_analysis_report(query, refined_task, execution_plan, executor_results)
+            task_state.add_history("chancellor_agent", "分析报告生成完成", report, task_id)
+            final_result = {
+                "mode": "report",
+                "source_agent": "chancellor_agent",
+                "content": report,
+            }
         yield ("final", "done", final_result)
 
 

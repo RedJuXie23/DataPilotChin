@@ -938,6 +938,8 @@ async def chat_with_qin_dynasty(session_id: str, req: QueryRequest):
             return str(content)[:3000]
         if content.get("mode") == "chat":
             return str(content.get("response", ""))[:3000]
+        if content.get("mode") == "report":
+            return str(content.get("content", ""))[:5000]
         summaries = []
         for agent_name, result in content.items():
             if isinstance(result, dict) and result.get("summary"):

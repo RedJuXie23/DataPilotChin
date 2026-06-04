@@ -41,6 +41,7 @@ export interface ChatMessage {
   content: string;
   agent?: string;
   agentEventKey?: string;
+  messageKind?: 'report';
   timestamp: number;
 }
 

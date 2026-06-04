@@ -122,6 +122,75 @@ async function loadPlotlyRuntime() {
   return (module as any).default || module
 }
 
+function sanitizeReportFilename(value: string): string {
+  const cleaned = value
+    .replace(/[\\/:*?"<>|]/g, ' ')
+    .replace(/\s+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60)
+  return cleaned || 'datapilot-analysis-report'
+}
+
+function isReportMessage(message: ChatMessage): boolean {
+  return message.messageKind === 'report'
+    || (message.agent === 'chancellor_agent' && /^#\s*数据分析报告/m.test(message.content))
+}
+
+async function plotlyJsonToPngDataUri(jsonData: string): Promise<string> {
+  const figure = JSON.parse(jsonData)
+  const Plotly = await loadPlotlyRuntime()
+  const layout = {
+    ...normalizePlotlyLayout(figure),
+    width: 1400,
+    height: 800,
+    autosize: false,
+    paper_bgcolor: 'white',
+    plot_bgcolor: 'white',
+    font: { color: '#111827', ...(figure.layout?.font || {}) },
+  }
+  return Plotly.toImage(
+    { data: figure.data || [], layout },
+    { format: 'png', width: 1400, height: 800, scale: 2 }
+  )
+}
+
+async function buildDownloadableReportMarkdown(content: string): Promise<string> {
+  const segments = parsePlotlyMarkers(content)
+  let chartIndex = 1
+  const parts: string[] = []
+
+  for (const segment of segments) {
+    if (segment.type === 'markdown') {
+      parts.push(segment.content)
+      continue
+    }
+    try {
+      const dataUri = await plotlyJsonToPngDataUri(segment.content)
+      parts.push(`\n\n![图 ${chartIndex}](${dataUri})\n\n`)
+      chartIndex += 1
+    } catch {
+      parts.push(`\n\n> 图 ${chartIndex} 导出失败，以下保留原始 Plotly JSON。\n\n\`\`\`json\n${segment.content}\n\`\`\`\n\n`)
+      chartIndex += 1
+    }
+  }
+
+  return parts.join('').replace(/\n{4,}/g, '\n\n\n').trim() + '\n'
+}
+
+async function downloadReportMarkdown(content: string): Promise<void> {
+  const markdown = await buildDownloadableReportMarkdown(content)
+  const title = content.match(/^#\s+(.+)$/m)?.[1] || 'datapilot-analysis-report'
+  const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = `${sanitizeReportFilename(title)}.md`
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  URL.revokeObjectURL(url)
+}
+
 // Plotly chart component
 function PlotlyChart({ jsonData }: { jsonData: string }) {
   const [figData, setFigData] = React.useState<any>(null)
@@ -573,13 +642,23 @@ export default function ChatPage() {
           setLoading(false)
         } else if (event.type === 'final' && event.status === 'success') {
           // 处理成功的最终结果
-          if (event.content && typeof event.content === 'string') {
+          const finalContent = typeof event.content === 'string'
+            ? event.content
+            : event.content?.mode === 'report'
+              ? event.content.content
+              : ''
+          const finalAgent = event.content?.mode === 'report'
+            ? event.content.source_agent || 'chancellor_agent'
+            : 'assistant'
+          const finalMessageKind = event.content?.mode === 'report' ? 'report' as const : undefined
+          if (finalContent) {
             setMessages(prev => {
               const assistantMsg: ChatMessage = {
                 id: `final-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
                 role: 'assistant',
-                content: event.content,
-                agent: 'assistant',
+                content: finalContent,
+                agent: finalAgent,
+                messageKind: finalMessageKind,
                 timestamp: Date.now(),
               }
               const updated = [...prev, assistantMsg]
@@ -1060,6 +1139,14 @@ export default function ChatPage() {
                     </div>
                   )}
                   <MessageContent content={msg.content} />
+                  {isReportMessage(msg) && (
+                    <button
+                      onClick={() => downloadReportMarkdown(msg.content)}
+                      className="mt-3 text-xs bg-[var(--bg-tertiary)] hover:bg-brand-600 text-[var(--text-primary)] hover:text-white px-3 py-1.5 rounded transition-colors"
+                    >
+                      下载 Markdown 报告
+                    </button>
+                  )}
                   {msg.role === 'assistant' && extractCodeFromMarkdown(msg.content) && (
                     <button
                       onClick={() => startEditCode(extractCodeFromMarkdown(msg.content)!)}

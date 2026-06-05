@@ -154,10 +154,18 @@ async function plotlyJsonToPngDataUri(jsonData: string): Promise<string> {
   )
 }
 
-async function buildDownloadableReportMarkdown(content: string): Promise<string> {
+interface ChartData {
+  index: number
+  filename: string
+  dataUri: string
+  jsonContent: string
+}
+
+async function buildDownloadableReportMarkdown(content: string): Promise<{ markdown: string; charts: ChartData[] }> {
   const segments = parsePlotlyMarkers(content)
   let chartIndex = 1
   const parts: string[] = []
+  const charts: ChartData[] = []
 
   for (const segment of segments) {
     if (segment.type === 'markdown') {
@@ -166,7 +174,15 @@ async function buildDownloadableReportMarkdown(content: string): Promise<string>
     }
     try {
       const dataUri = await plotlyJsonToPngDataUri(segment.content)
-      parts.push(`\n\n![图 ${chartIndex}](${dataUri})\n\n`)
+      const filename = `chart_${chartIndex}.png`
+      // 使用相对路径引用图片
+      parts.push(`\n\n![图 ${chartIndex}](${filename})\n\n`)
+      charts.push({
+        index: chartIndex,
+        filename,
+        dataUri,
+        jsonContent: segment.content
+      })
       chartIndex += 1
     } catch {
       parts.push(`\n\n> 图 ${chartIndex} 导出失败，以下保留原始 Plotly JSON。\n\n\`\`\`json\n${segment.content}\n\`\`\`\n\n`)
@@ -174,21 +190,46 @@ async function buildDownloadableReportMarkdown(content: string): Promise<string>
     }
   }
 
-  return parts.join('').replace(/\n{4,}/g, '\n\n\n').trim() + '\n'
+  return {
+    markdown: parts.join('').replace(/\n{4,}/g, '\n\n\n').trim() + '\n',
+    charts
+  }
 }
 
-async function downloadReportMarkdown(content: string): Promise<void> {
-  const markdown = await buildDownloadableReportMarkdown(content)
-  const title = content.match(/^#\s+(.+)$/m)?.[1] || 'datapilot-analysis-report'
-  const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' })
+async function downloadFile(content: string | Uint8Array, filename: string, type: string): Promise<void> {
+  const blob = new Blob([content as BlobPart], { type })
   const url = URL.createObjectURL(blob)
   const anchor = document.createElement('a')
   anchor.href = url
-  anchor.download = `${sanitizeReportFilename(title)}.md`
+  anchor.download = filename
   document.body.appendChild(anchor)
   anchor.click()
   anchor.remove()
   URL.revokeObjectURL(url)
+}
+
+async function downloadReportMarkdown(content: string): Promise<void> {
+  const { markdown, charts } = await buildDownloadableReportMarkdown(content)
+  const title = content.match(/^#\s+(.+)$/m)?.[1] || 'datapilot-analysis-report'
+  const sanitizedTitle = sanitizeReportFilename(title)
+  
+  // 先下载所有图片文件
+  for (const chart of charts) {
+    // 从Data URI提取二进制数据
+    const base64Data = chart.dataUri.split(',')[1]
+    const binaryData = atob(base64Data)
+    const arrayBuffer = new ArrayBuffer(binaryData.length)
+    const uint8Array = new Uint8Array(arrayBuffer)
+    for (let i = 0; i < binaryData.length; i++) {
+      uint8Array[i] = binaryData.charCodeAt(i)
+    }
+    await downloadFile(uint8Array, chart.filename, 'image/png')
+    // 添加延迟，确保浏览器能处理多个下载
+    await new Promise(resolve => setTimeout(resolve, 200))
+  }
+  
+  // 最后下载Markdown文件
+  await downloadFile(markdown, `${sanitizedTitle}.md`, 'text/markdown;charset=utf-8')
 }
 
 // Plotly chart component

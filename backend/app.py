@@ -997,6 +997,29 @@ async def chat_with_qin_dynasty(session_id: str, req: QueryRequest):
                         "status": "success" if status in ("done", "success") else status,
                         "task_state": task_state.get_state_snapshot(),
                     }
+                    # 保存结构化的执行结果到 chat_history
+                    if isinstance(content, dict):
+                        chat_history_entry = {
+                            "role": "assistant",
+                            "mode": content.get("mode", "execute"),
+                            "executor_results": {},
+                        }
+                        if content.get("mode") == "report":
+                            chat_history_entry["report"] = content.get("content", "")
+                        # 获取执行结果（可能是 content 本身或者是 content.executor_results）
+                        executor_results = content.get("executor_results", content) if content.get("mode") != "report" else content.get("executor_results", {})
+                        if content.get("mode") != "report" and not executor_results:
+                            executor_results = content
+                        # 保存执行智能体的完整结果
+                        for agent_name_res, result in executor_results.items():
+                            if isinstance(result, dict):
+                                chat_history_entry["executor_results"][agent_name_res] = {
+                                    "summary": result.get("summary", ""),
+                                    "result": result.get("result", ""),
+                                    "code": result.get("code", ""),
+                                    "code_executed": result.get("code_executed", False),
+                                }
+                        session["chat_history"].append(chat_history_entry)
                 else:
                     payload = {
                         "type": "agent_status",

@@ -166,11 +166,14 @@ class censor_agent(dspy.Signature):
 4. 如发现错误、遗漏或逻辑问题，打回并要求重做
 5. 审查通过后，任务结果返回给用户
 
+### 重要说明：
+如果任务包含报告请求，报告将由丞相在审查通过后最后撰写，执行智能体只需要完成自己的分析任务即可，不需要撰写报告。
+
 ### 严格审查标准：
 1. 代码完整性：检查代码是否完整（不能是空的或不完整的代码片段）
 2. 代码可执行性：检查代码是否有语法错误或明显的逻辑问题
 3. 结果有效性：检查执行结果是否有效（对于数据可视化，必须有图表输出）
-4. 任务完成度：检查是否完成了用户要求的任务
+4. 任务完成度：检查是否完成了用户要求的任务（如果包含报告请求，执行智能体只需要完成分析任务，报告由丞相最后撰写）
 5. **代码必须被执行**：检查每个执行智能体的"运行结果"是否为空，如果为空则必须打回
 6. **执行状态标记**：检查每个智能体的"状态"是否标记为"完整"
 
@@ -183,6 +186,7 @@ class censor_agent(dspy.Signature):
 - 执行结果为空或错误
 - 代码逻辑明显不符合任务要求
 - 任何执行智能体的状态标记为"不完整"
+- 【重要】不要因为"没有撰写报告"而打回执行智能体，如果任务包含报告请求，报告由丞相在最后撰写
 
 打回格式（JSON）：
 {
@@ -214,6 +218,8 @@ class commander_agent(dspy.Signature):
 4. 将子任务分发给对应的执行智能体
 5. 收集执行结果，汇总后提交给御史大夫审查
 6. 如收到御史大夫的打回，重新规划或重新分发
+7. 如果丞相指定的“拟调用智能体”无法满足所有子任务，你可以调整要调用的智能体，以确保任务能被成功执行
+8. 即使用户要求撰写报告，也不得要求执行智能体撰写报告，因为报告由丞相在最后撰写
 
 ### 重要要求：
 - 如果子任务包含数据可视化智能体（data_viz_agent），必须在其instruction中明确强调：
@@ -287,6 +293,11 @@ work, empty output, runtime error, invalid code, or a requested visualization wi
 rendered Plotly chart. Do not reject correct work for optional enhancements or stylistic
 preferences. When rejecting, return approved=false, target, comments, and severity.
 When approving, return approved=true and a short summary.
+
+IMPORTANT: If the task includes a report request (report_requested=true), the final report
+will be written by the chancellor AFTER your review passes. You should NOT reject the
+executors just because they did not write a report. The executors only need to complete
+their own analysis tasks; the report is the chancellor's responsibility.
 """
 
 commander_agent.instructions = """
@@ -768,11 +779,38 @@ class qin_dynasty_orchestrator(dspy.Module):
         report_patterns = (
             r"(生成|输出|出|写|整理|给我|要|需要).{0,12}(报告|分析报告|总结报告|研究报告|文档)",
             r"(报告|分析报告|总结报告|研究报告|文档).{0,12}(生成|输出|写|整理|图文并茂)",
-            r"图文并茂",
             r"(generate|write|create|produce).{0,24}(report|analysis report|written report|document)",
             r"(report|analysis report|written report|document).{0,24}(with charts|rich|visual|figure)",
         )
         return self._matches_any(normalized, report_patterns)
+
+    def _is_report_only_request(self, query):
+        """检测纯报告请求（只要求撰写报告，不包含其他分析任务）。"""
+        if not self._is_report_requested(query):
+            return False
+        normalized = self._clean_user_query(query)
+        # 检查是否包含其他分析指令
+        analysis_terms = (
+            "分析", "统计", "建模", "预测", "清洗", "预处理", "画图", "绘图", "可视化",
+            "analyze", "analyse", "clean", "preprocess", "model", "predict", 
+            "plot", "chart", "visualize",
+        )
+        # 如果只包含报告相关词汇，不包含分析词汇，则是纯报告请求
+        report_only_patterns = (
+            r"^[\s\w]*报告[\s\w]*$",
+            r"^[\s\w]*总结[\s\w]*报告[\s\w]*$",
+            r"^[\s\w]*分析报告[\s\w]*$",
+            r"^[\s\w]*生成报告[\s\w]*$",
+            r"^[\s\w]*写报告[\s\w]*$",
+            r"^[\s\w]*给我报告[\s\w]*$",
+        )
+        # 检查是否是纯报告请求模式
+        if self._matches_any(normalized, report_only_patterns):
+            return True
+        # 如果没有任何分析相关词汇，也是纯报告请求
+        if not self._contains_any(normalized, analysis_terms):
+            return True
+        return False
 
     def _is_rerun_request(self, query):
         normalized = self._clean_user_query(query)
@@ -842,6 +880,9 @@ class qin_dynasty_orchestrator(dspy.Module):
             return False
         if self._is_conversation_only_request(normalized):
             return False
+        # 纯报告请求不需要执行智能体，直接由丞相生成报告
+        if self._is_report_only_request(normalized):
+            return False
 
         explicit_patterns = (
             r"(分析|统计|建模|预测|清洗|预处理|画图|绘图|可视化).{0,12}(数据|数据集|文件|表格|样本|变量|字段)",
@@ -856,7 +897,7 @@ class qin_dynasty_orchestrator(dspy.Module):
             "make a chart", "plot the data",
         )
         return (
-            self._is_report_requested(normalized)
+            self._is_report_requested(normalized) and not self._is_report_only_request(normalized)
             or self._matches_any(normalized, explicit_patterns)
             or self._contains_any(normalized, single_intent_terms)
         )
@@ -878,7 +919,7 @@ class qin_dynasty_orchestrator(dspy.Module):
             ),
             "data_viz_agent": self._contains_any(
                 normalized,
-                ("可视化", "画图", "绘图", "图表", "plot", "chart", "graph", "visual", "figure"),
+                ("可视化", "画图", "绘图", "绘制", "图表", "plot", "chart", "graph", "visual", "figure", "直方图", "柱状图", "散点图", "折线图"),
             ) or self._is_report_requested(normalized),
         }
 
@@ -937,7 +978,7 @@ class qin_dynasty_orchestrator(dspy.Module):
             ),
             (
                 "data_viz_agent",
-                ("可视化", "画图", "绘图", "图表", "plot", "chart", "graph", "visual", "figure"),
+                ("可视化", "画图", "绘图", "绘制", "图表", "plot", "chart", "graph", "visual", "figure", "直方图", "柱状图", "散点图", "折线图"),
                 "使用 Plotly 基于现有上下文变量完成用户要求的可视化，每张图调用 fig.show(renderer='json')。不要生成占位图。",
             ),
         ]
@@ -990,6 +1031,16 @@ class qin_dynasty_orchestrator(dspy.Module):
                 "subtasks": self._infer_subtasks(display_instruction),
             }
             return types.SimpleNamespace(refined_task=json.dumps(task, ensure_ascii=False))
+        # 纯报告请求：直接由丞相根据历史记录生成报告，不需要执行智能体
+        if self._is_report_only_request(instruction):
+            display_instruction = instruction.partition(" | ts=")[0]
+            return types.SimpleNamespace(refined_task=json.dumps({
+                "mode": "report",
+                "user_goal": display_instruction,
+                "refined_goal": "基于对话历史中的所有分析结果生成综合报告",
+                "report_requested": True,
+                "subtasks": [],
+            }, ensure_ascii=False))
         return await self._chancellor_predict(**kwargs)
 
     def _ensure_report_visualization_subtask(self, subtasks, query):
@@ -1270,13 +1321,15 @@ class qin_dynasty_orchestrator(dspy.Module):
                 continue
             for source in (result.get("result", ""), result.get("summary", "")):
                 for match in re.finditer(
-                    r"<<<PLOTLY_JSON>>>\n([\s\S]*?)\n<<<END_PLOTLY_JSON>>>",
+                    r"<<<PLOTLY_JSON>>>\s*([\s\S]*?)\s*<<<END_PLOTLY_JSON>>>",
                     str(source or ""),
+                    re.DOTALL,
                 ):
                     payload = match.group(1).strip()
                     if payload and payload not in seen:
                         seen.add(payload)
                         charts.append(payload)
+                        logger.info(f"从执行结果中提取到图表: {payload[:100]}...")
         return charts
 
     def _build_analysis_report(self, query, refined_task, execution_plan, executor_results):
@@ -1329,7 +1382,265 @@ class qin_dynasty_orchestrator(dspy.Module):
             "以上结论基于当前上传数据、执行代码结果和御史大夫审核通过的智能体输出生成。",
         ])
         return "\n\n".join(part for part in report if part is not None).strip()
-    
+
+    def _extract_executor_results_from_history(self, task_state, chat_history=None):
+        """从历史任务记录和对话历史中提取所有执行智能体的结果。"""
+        executor_results = {}
+        charts = []
+        seen = set()
+        
+        def extract_charts_from_text(text):
+            """从文本中提取所有 PLOTLY JSON 块。"""
+            if not text:
+                return
+            # 使用更宽松的正则表达式，允许标记和内容之间没有换行
+            for match in re.finditer(
+                r"<<<PLOTLY_JSON>>>\s*([\s\S]*?)\s*<<<END_PLOTLY_JSON>>>",
+                str(text),
+                re.DOTALL,
+            ):
+                payload = match.group(1).strip()
+                if payload and payload not in seen:
+                    seen.add(payload)
+                    charts.append(payload)
+                    logger.info(f"提取到图表: {payload[:100]}...")
+        
+        def merge_result(agent_name, result_dict):
+            """合并同一个智能体的结果。"""
+            if agent_name in executor_results:
+                existing = executor_results[agent_name]
+                if result_dict.get("summary") and result_dict["summary"] not in existing.get("summary", ""):
+                    existing["summary"] = existing.get("summary", "") + "\n\n" + result_dict["summary"]
+                if result_dict.get("result") and result_dict["result"] not in existing.get("result", ""):
+                    existing["result"] = existing.get("result", "") + "\n\n" + result_dict["result"]
+                if result_dict.get("code") and result_dict["code"] not in existing.get("code", ""):
+                    existing["code"] = existing.get("code", "") + "\n\n" + result_dict["code"]
+            else:
+                executor_results[agent_name] = {
+                    "summary": result_dict.get("summary", ""),
+                    "result": result_dict.get("result", ""),
+                    "code": result_dict.get("code", ""),
+                    "code_executed": result_dict.get("code_executed", True),
+                }
+        
+        # 遍历当前任务历史
+        # 先收集所有记录，分开处理文本格式和JSON格式
+        text_records = {}  # agent -> 文本内容（用于提取图表）
+        json_records = {}  # agent -> JSON内容（用于提取结构化数据）
+        
+        for record in task_state.task_history:
+            agent = record.get("agent", "")
+            result = record.get("result", "")
+            
+            if not result:
+                continue
+                
+            # 检查是否是结构化记录（以_dict结尾）
+            if agent.endswith("_dict"):
+                base_agent = agent[:-5]  # 去掉 "_dict"
+                if base_agent in self.executors:
+                    json_records[base_agent] = result
+            elif agent in self.executors:
+                # 这是文本格式的记录（包含图表标记）
+                if agent in text_records:
+                    text_records[agent] += "\n\n" + str(result)
+                else:
+                    text_records[agent] = str(result)
+        
+        # 处理文本格式记录（提取图表和作为 result 字段）
+        for agent, text in text_records.items():
+            # 提取图表
+            extract_charts_from_text(text)
+            # 将文本作为 result 字段保存
+            merge_result(agent, {"result": text, "summary": "", "code": ""})
+        
+        # 处理 JSON 格式记录（提取结构化数据）
+        for agent, json_str in json_records.items():
+            try:
+                result_dict = parse_json_object(json_str, "history record")
+                merge_result(agent, result_dict)
+            except Exception:
+                # 如果解析失败，跳过这个记录
+                pass
+        
+        # 从对话历史中提取执行结果
+        if chat_history:
+            for record in chat_history:
+                if not isinstance(record, dict):
+                    continue
+                
+                # 检查是否有结构化的执行结果
+                if "executor_results" in record:
+                    for agent, result in record.get("executor_results", {}).items():
+                        if agent not in self.executors:
+                            continue
+                        if isinstance(result, dict):
+                            summary = result.get("summary", "")
+                            run_result = result.get("result", "")
+                            code = result.get("code", "")
+                            
+                            if summary or run_result or code:
+                                merge_result(agent, {
+                                    "summary": summary,
+                                    "result": run_result,
+                                    "code": code,
+                                    "code_executed": result.get("code_executed", False),
+                                })
+                                # 从 result 和 summary 中提取图表
+                                extract_charts_from_text(run_result)
+                                extract_charts_from_text(summary)
+                
+                # 从文本内容中提取图表（包括之前的报告内容）
+                content = record.get("content", "") or record.get("report", "")
+                if isinstance(content, str):
+                    extract_charts_from_text(content)
+        
+        return executor_results, charts
+
+    def _format_results_for_llm(self, executor_results):
+        """格式化执行结果供 LLM 总结使用。"""
+        sections = []
+        agent_labels = {
+            "preprocessing_agent": "数据预处理",
+            "statistical_analytics_agent": "统计分析",
+            "sk_learn_agent": "机器学习",
+            "data_viz_agent": "数据可视化",
+        }
+        agent_order = ["preprocessing_agent", "statistical_analytics_agent", "sk_learn_agent", "data_viz_agent"]
+        sorted_agents = sorted(executor_results.keys(), key=lambda x: agent_order.index(x) if x in agent_order else 99)
+        
+        for agent_name in sorted_agents:
+            result = executor_results[agent_name]
+            if not isinstance(result, dict):
+                continue
+            summary = self._strip_plotly_payloads(result.get("summary", "")).strip()
+            run_result = self._strip_plotly_payloads(result.get("result", "")).strip()
+            
+            if summary or run_result:
+                label = agent_labels.get(agent_name, agent_name)
+                text = f"## {label}\n"
+                if summary:
+                    text += f"### 分析说明\n{summary}\n\n"
+                if run_result:
+                    # 截取部分运行结果
+                    truncated = run_result[:2000]
+                    text += f"### 运行结果\n{truncated}\n"
+                sections.append(text)
+        
+        return "\n".join(sections) if sections else "（无可用分析结果）"
+
+    async def _llm_summarize_report(self, query, goal, executor_results_text, charts_count, session_lm):
+        """使用 LLM 生成专业的报告内容。"""
+        prompt = f"""作为丞相的同时，你也是一位资深数据分析师，请基于以下分析结果撰写一份完整、专业的分析报告。
+
+## 用户原始需求
+{query}
+
+## 分析目标
+{goal}
+
+## 已完成的分析结果
+{executor_results_text}
+
+## 可视化图表
+本次报告包含 {charts_count} 张图表，将在报告中以交互式图表形式展示。
+
+## 报告要求
+1. 报告应包含以下章节：
+   - 执行摘要：简要说明本次分析的目的、方法和主要发现
+   - 数据概览：描述所使用的数据集及其关键特征
+   - 详细分析：按分析类型（数据预处理、统计分析、机器学习、可视化）组织详细发现
+   - 关键发现：列出最重要的 3-5 个关键洞察
+   - 结论与建议：基于分析结果给出结论和可操作的建议
+2. 语言专业、清晰，使用中文
+3. 避免重复堆砌原始数据，重点是提炼洞察
+4. 不要重复列出代码或原始输出，只总结关键结论
+5. 报告应使用 Markdown 格式，章节标题使用 ## 和 ###
+6. 不要包含图表占位符，图表将由系统自动插入
+7. 不要使用 HTML 标签或转义字符
+
+请直接输出报告内容，不要输出"以下是报告"之类的引导语。"""
+        try:
+            with dspy.context(lm=session_lm):
+                predict = dspy.Predict("prompt->summary")
+                result = await _run_sync(predict, prompt=prompt[:8000])
+                return str(result.summary).strip()
+        except Exception as e:
+            logger.error(f"LLM 报告生成失败: {e}")
+            return None
+
+    async def _build_analysis_report_from_history(self, query, refined_task, task_state, chat_history=None, session_lm=None):
+        """基于历史对话记录生成综合分析报告。"""
+        goal = self._compact_display_text(refined_task.get("refined_goal"), query)
+        
+        # 从历史记录中提取执行结果
+        executor_results, charts = self._extract_executor_results_from_history(task_state, chat_history)
+        
+        # 格式化执行结果
+        results_text = self._format_results_for_llm(executor_results)
+        
+        # 使用 LLM 生成报告主体
+        llm_content = None
+        if session_lm is not None:
+            llm_content = await self._llm_summarize_report(
+                query, goal, results_text, len(charts), session_lm
+            )
+        
+        # 如果 LLM 生成失败或不可用，使用结构化报告
+        if llm_content:
+            report = [llm_content]
+        else:
+            # 后备方案：结构化汇总报告
+            report = [
+                "# 数据分析报告",
+                "",
+                f"## 分析目标\n\n{goal}",
+            ]
+            
+            # 详细分析章节
+            if executor_results:
+                report.extend(["", "## 详细分析", ""])
+                agent_labels = {
+                    "preprocessing_agent": "数据预处理",
+                    "statistical_analytics_agent": "统计分析",
+                    "sk_learn_agent": "机器学习",
+                    "data_viz_agent": "数据可视化",
+                }
+                agent_order = ["preprocessing_agent", "statistical_analytics_agent", "sk_learn_agent", "data_viz_agent"]
+                sorted_agents = sorted(executor_results.keys(), key=lambda x: agent_order.index(x) if x in agent_order else 99)
+                
+                for agent_name in sorted_agents:
+                    result = executor_results[agent_name]
+                    if not isinstance(result, dict):
+                        continue
+                    summary = self._strip_plotly_payloads(result.get("summary", "")).strip()
+                    if summary:
+                        label = agent_labels.get(agent_name, agent_name)
+                        report.append(f"### {label}\n\n{summary}")
+            
+            if not executor_results:
+                report.append("\n对话历史中暂无可汇总的结构化分析结果。")
+            
+            report.extend([
+                "",
+                "## 结论",
+                "",
+                "以上结论基于对话历史中的所有数据分析结果综合生成。",
+            ])
+        
+        # 添加图表（确保图表嵌入到报告中）
+        if charts:
+            report.append("")
+            report.append("## 可视化图表")
+            report.append("")
+            for index, chart in enumerate(charts, 1):
+                report.append(f"### 图 {index}")
+                report.append("")
+                report.append(f"<<<PLOTLY_JSON>>>\n{chart}\n<<<END_PLOTLY_JSON>>>")
+                report.append("")
+        
+        return "\n".join(part for part in report if part is not None).strip()
+
     async def execute_user_query(self, query, session_lm, task_state: AgentTaskState, datasets: dict, chat_history=None, stop_flag=None):
         """执行用户查询的完整流程（SSE 生成器）。
         
@@ -1395,6 +1706,15 @@ class qin_dynasty_orchestrator(dspy.Module):
                     task_state.add_history("chancellor_agent", "直接对话回复", direct_response, task_id)
                     yield ("chancellor_agent", "done", direct_response)
                     yield ("final", "done", {"mode": "chat", "response": direct_response})
+                    return
+                # 纯报告请求：直接由丞相根据历史记录生成报告
+                if str(refined_task.get("mode", "execute")).lower() == "report":
+                    task_state.set_status("chancellor_agent", "done", task_id)
+                    task_state.add_message("秦始皇", "chancellor_agent", query, task_id)
+                    report = await self._build_analysis_report_from_history(query, refined_task, task_state, chat_history, session_lm)
+                    task_state.add_history("chancellor_agent", "分析报告生成完成", report, task_id)
+                    yield ("chancellor_agent", "done", report)
+                    yield ("final", "done", {"mode": "report", "source_agent": "chancellor_agent", "content": report})
                     return
                 if self._is_conversation_only_request(query):
                     direct_response = (
@@ -1777,6 +2097,11 @@ class qin_dynasty_orchestrator(dspy.Module):
             review_context = f"用户指令：{query_with_timestamp}\n\n"
             review_context += f"丞相细化任务：{refined_task_str}\n"
             review_context += f"太尉执行计划：{execution_plan_str}\n\n"
+            
+            # 如果要求撰写报告，在审查上下文中明确说明报告是由丞相最后撰写的
+            if bool(refined_task.get("report_requested", False)):
+                review_context += "【重要提示】本任务包含报告请求。请注意：报告将由丞相在审查通过后最后撰写，执行智能体只需要完成自己的分析任务即可。\n\n"
+            
             review_context += "执行结果详情：\n\n"
             
             # 检查是否有任何执行智能体返回了结果
@@ -1937,6 +2262,27 @@ class qin_dynasty_orchestrator(dspy.Module):
             return
 
         final_result = executor_results
+        # 将执行结果保存到 task_history 中，以便后续撰写报告时能够从历史中提取
+        for agent_name, result in executor_results.items():
+            if isinstance(result, dict):
+                # 保存每个执行智能体的结果到历史记录
+                # 注意：不要使用 json.dumps，因为这会转义 <<<PLOTLY_JSON>>> 标记
+                # 直接保存原始结果字符串，以便后续提取图表
+                result_str = str(result.get("result", "")) + "\n\n" + str(result.get("summary", ""))
+                if result_str.strip():
+                    task_state.add_history(
+                        agent_name,
+                        "执行结果",
+                        result_str.strip(),
+                        task_id
+                    )
+                # 同时保存完整的字典形式，用于其他用途
+                task_state.add_history(
+                    agent_name + "_dict",
+                    "执行结果(结构化)",
+                    json.dumps(result, ensure_ascii=False, indent=2),
+                    task_id
+                )
         if bool(refined_task.get("report_requested", False)):
             report = self._build_analysis_report(query, refined_task, execution_plan, executor_results)
             task_state.add_history("chancellor_agent", "分析报告生成完成", report, task_id)
@@ -1944,6 +2290,7 @@ class qin_dynasty_orchestrator(dspy.Module):
                 "mode": "report",
                 "source_agent": "chancellor_agent",
                 "content": report,
+                "executor_results": executor_results,  # 同时保存执行结果以便后续撰写报告时能够从历史中提取
             }
         yield ("final", "done", final_result)
 

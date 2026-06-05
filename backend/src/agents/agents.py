@@ -128,7 +128,7 @@ class intent_classifier_agent(dspy.Signature):
     """你是丞相的第二人格，一个意图判定专家，负责分析用户（秦始皇）查询并判断其意图。
 
 **职责：**
-1. 识别用户查询的类型（纯对话、执行请求、报告请求、重新执行请求等）
+1. 识别用户查询的类型（纯对话/闲聊、执行请求、报告请求、重新执行请求等）
 2. 识别用户需要哪些执行智能体（数据预处理、统计分析、机器学习、数据可视化）
 3. 判断是否为纯报告请求（只要求撰写报告，不包含其他分析任务）
 4. 判断是否为对话请求（不需要执行数据分析）
@@ -151,7 +151,7 @@ class intent_classifier_agent(dspy.Signature):
 ```
 
 **字段说明：**
-- `is_conversation_only`: 是否为纯对话请求（解释、提问、打招呼等，不需要数据分析）
+- `is_conversation_only`: 是否为纯对话请求（闲聊、打招呼、解释、提问等，不需要数据分析）
 - `is_report_requested`: 是否请求生成报告
 - `is_report_only`: 是否为纯报告请求（只写报告，不需要执行新的分析）
 - `is_rerun_request`: 是否请求重新执行上一轮任务
@@ -159,11 +159,23 @@ class intent_classifier_agent(dspy.Signature):
 - `requested_agents`: 各执行智能体的需求状态
 
 **判定规则：**
-1. **is_conversation_only**: 用户只是询问概念、解释、定义等，没有要求执行任何分析
-2. **is_report_requested**: 用户明确要求生成报告、分析报告、总结报告等
+1. **is_conversation_only**: 以下情况应判定为 true：
+   - 闲聊问候：打招呼、问候语等，可能有类似皇帝口吻的话语
+   - 日常对话：不涉及数据分析的日常交流，可能有类似皇帝口吻的话语
+   - 解释提问：询问概念、定义、解释等
+   - 追问上一轮结果：询问之前分析结果的含义或特定部分
+   - 明确不执行：用户明确表示不需要执行分析
+   - 纯概念讨论：讨论数据分析概念、方法论等，不涉及具体数据操作
+   - 数据集介绍请求：询问数据集内容、字段等（不需要执行计算）
+   
+2. **is_report_requested**: 用户明确要求生成报告、分析报告、总结报告、研究报告、文档等
+
 3. **is_report_only**: 用户只要求写报告，没有要求进行任何数据分析
+
 4. **is_rerun_request**: 用户要求重新执行、再次执行、复现上次任务等
+
 5. **is_execution_request**: 用户要求进行数据分析、统计、建模、可视化等
+
 6. **requested_agents**: 根据用户需求判断需要哪些执行智能体
 
 **智能体触发条件：**
@@ -323,9 +335,21 @@ description, recent conversation history, and the complete compacted record of p
 agent activity. Return one JSON object only.
 
 For ordinary conversation, follow-up questions about prior work, explanations, greetings,
-or requests that do not require new data computation, return:
+small talk, or requests that do not require new data computation, return:
 {"mode":"chat","response":"answer in the user's language","subtasks":[]}
-Answer from the provided context. Do not dispatch executors just to restate or explain prior work.
+
+Types of chat requests that should NOT trigger execution:
+- Greetings and salutations
+- Small talk and casual conversation
+- Explanations and definitions
+- Follow-up questions about prior work or analysis results
+- Dataset exploration without computation (describing what's in the data)
+- Concept discussions (methodologies, theory, best practices)
+
+Answer naturally in the user's language. If the user asks about the dataset, provide a
+friendly summary based on the dataset description. Do not dispatch executors just to
+restate or explain prior work or dataset contents.
+
 Exception: if the user asks to rerun, re-execute, repeat, or run the previous task again,
 return mode="execute" and reconstruct the prior executable subtasks from conversation_history.
 
@@ -1899,16 +1923,41 @@ class qin_dynasty_orchestrator(dspy.Module):
         is_rerun_request = intent_result.get("is_rerun_request", False)
         requested_agents = intent_result.get("requested_agents", {})
         
-        # 如果是纯对话请求，直接响应
+        # 如果是纯对话请求，调用丞相智能体进行响应（允许访问数据集信息）
         if is_conversation_only and not is_rerun_request:
-            direct_response = (
-                "陛下圣明。臣等悉听君令，愿为陛下效犬马之劳。"
-                "臣等愚钝，还请陛下明示您想了解的概念或上一轮结果中的哪一部分。"
-            )
+            task_state.set_status("chancellor_agent", "working", task_id)
+            yield ("chancellor_agent", "working", "正在理解您的问题...")
+            try:
+                with dspy.context(lm=session_lm):
+                    chancellor_result = await asyncio.wait_for(
+                        self._chancellor_predict(
+                            user_instruction=query_with_timestamp,
+                            dataset_description=self._get_routing_dataset_description(),
+                            conversation_history=conversation_context,
+                        ),
+                        timeout=CHANCELLOR_TIMEOUT_SECONDS
+                    )
+                refined_task_str = chancellor_result.refined_task
+                try:
+                    refined_task = parse_json_object(refined_task_str, "chancellor")
+                    direct_response = str(refined_task.get("response", "")).strip()
+                    if not direct_response:
+                        raise ValueError("chancellor response is empty")
+                except Exception:
+                    # 如果解析失败，直接使用原始响应
+                    direct_response = str(refined_task_str)[:2000]
+                
+                if not direct_response:
+                    direct_response = "臣已理解您的问题。根据当前数据集，" \
+                        "请允许臣为您解释相关内容。"
+            except Exception as e:
+                logger.error(f"丞相处理纯对话请求失败: {e}")
+                direct_response = f"丞相处理出错：{str(e)}"
+            
             task_state.set_status("chancellor_agent", "done", task_id)
             task_state.add_message("秦始皇", "chancellor_agent", query, task_id)
             task_state.add_message("chancellor_agent", "秦始皇", direct_response, task_id, "direct_response")
-            task_state.add_history("chancellor_agent", "执行保护：转为直接对话", direct_response, task_id)
+            task_state.add_history("chancellor_agent", "直接对话回复", direct_response, task_id)
             yield ("chancellor_agent", "done", direct_response)
             yield ("final", "done", {"mode": "chat", "response": direct_response})
             return

@@ -49,7 +49,7 @@ npm install
 # 创建本地前端配置
 copy .env.example .env.local
 
-# 开发模式启动（支持热更新）
+# 前端启动
 npm run dev
 ```
 

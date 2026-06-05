@@ -1880,7 +1880,7 @@ class qin_dynasty_orchestrator(dspy.Module):
         
         
         # ── 执行智能体 + 御史大夫审查循环 ───────────────
-        MAX_ATTEMPTS = 3
+        MAX_ATTEMPTS = 5
         censor_feedback = ""
         executor_results = {}
         approved = False

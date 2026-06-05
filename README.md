@@ -11,7 +11,9 @@
 - 📁 **多格式支持** — 上传 CSV / XLSX / Parquet 文件即可开始分析
 - 💻 **代码执行** — 生成 Python 代码并实时执行，支持编辑与修复
 - 📈 **交互式图表** — Plotly 图表在界面中直接渲染
+- 📕 **报告下载** — 可下载 Markdown 报告及独立图片文件
 - 🔄 **实时状态展示** — 侧边栏实时显示各智能体工作状态
+- 🔒 **会话隔离** — 不同对话框数据完全隔离，互不干扰
 
 ## 🚀 快速开始
 
@@ -77,6 +79,10 @@ npm run dev
    - Markdown 格式的分析回答
    - 可执行的 Python 代码
    - 交互式的 Plotly 图表
+6. **下载报告**：
+   - 点击报告消息的下载按钮
+   - 自动下载 Markdown 文件和所有图表图片
+   - 将文件放在同一目录即可正常查看图片
 
 ## ⚠️ 安全提示
 
@@ -91,8 +97,8 @@ npm run dev
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
-| `LLM_PROVIDER` | LLM 提供商 | `deepseek` |
-| `LLM_MODEL` | 模型名称 | `deepseek-chat` |
+| `LLM_PROVIDER` | LLM 提供商 | `openai` |
+| `LLM_MODEL` | 模型名称 | `gpt-4o-mini` |
 | `OPENAI_API_KEY` | OpenAI API Key | - |
 | `ANTHROPIC_API_KEY` | Anthropic API Key | - |
 | `GEMINI_API_KEY` | Gemini API Key | - |
@@ -107,29 +113,44 @@ npm run dev
 
 ```
 DataPilot/
+├── .vscode/                    # VS Code 配置
+│   └── settings.json           # IDE 配置
+├── ReportExamples/             # 报告示例
+│   ├── datapilot-analysis-report.md  # 示例报告
+│   └── chart_*.png             # 示例图表
 ├── backend/                    # Python FastAPI 后端
 │   ├── app.py                  # 主应用入口（FastAPI + SSE 流式）
 │   ├── requirements.txt        # Python 依赖
 │   ├── .env.template           # 环境变量模板
 │   ├── start.bat              # Windows 启动脚本
+│   ├── sample_data.csv         # 示例数据集
 │   └── src/
 │       ├── agents/
-│       │   └── agents.py       # DSPy 智能体签名定义
-│       ├── orchestrator/       # 秦朝官职编排器
-│       │   └── qin_dynasty.py # 丞相→太尉→执行者→御史大夫
+│       │   ├── __init__.py
+│       │   └── agents.py       # DSPy 智能体签名定义与编排逻辑
+│       ├── __init__.py
 │       ├── format_response.py  # 响应格式化与代码执行
+│       ├── runtime_config.py   # 运行时配置参数
 │       └── simple_retriever.py # 简易检索器
 │
 └── frontend/                   # Next.js 前端
     ├── app/
     │   ├── page.tsx            # 页面入口
     │   ├── layout.tsx          # 布局（含 ThemeProvider）
-    │   ├── globals.css         # 全局样式（深色/浅色主题）
-    │   └── theme-provider.tsx  # 主题切换上下文
-    ├── components/chat/
-    │   └── ChatPage.tsx        # 聊天界面组件（含 SSE 流式解析）
+    │   └── globals.css         # 全局样式（深色/浅色主题）
+    ├── components/
+    │   ├── chat/
+    │   │   └── ChatPage.tsx    # 聊天界面组件（含 SSE 流式解析）
+    │   ├── Providers.tsx       # 应用提供者
+    │   └── ThemeProvider.tsx   # 主题切换上下文
     ├── lib/
     │   └── api.ts              # API 调用封装（含类型定义）
+    ├── types/
+    │   └── plotly-dist.d.ts    # Plotly 类型定义
+    ├── next.config.js          # Next.js 配置
+    ├── postcss.config.js       # PostCSS 配置
+    ├── tailwind.config.js      # Tailwind CSS 配置
+    ├── tsconfig.json           # TypeScript 配置
     └── package.json
 ```
 
@@ -157,21 +178,32 @@ DataPilot/
 
 | 官职 | 智能体名称 | 功能 | 技术栈 |
 |------|------------|------|--------|
-| 丞相 | `chancellor_agent` | 接收用户指令，细化任务目标 | DSPy + LLM |
+| 丞相 | `chancellor_agent` | 接收用户指令，细化任务目标，生成报告 | DSPy + LLM |
 | 太尉 | `commander_agent` | 规划拆解，分发子任务 | DSPy + LLM |
 | 执行者 | `preprocessing_agent` | 缺失值处理、类型转换 | Pandas / NumPy |
-| 执行者 | `statistical_analytics_agent` | 回归分析、方差分析 | statsmodels |
-| 执行者 | `sk_learn_agent` | 分类、回归、聚类 | scikit-learn |
-| 执行者 | `data_viz_agent` | 交互式图表生成 | Plotly |
-| 御史大夫 | `censor_agent` | 审查所有工作，可打回 | DSPy + LLM |
+| 执行者 | `statistical_analytics_agent` | 回归分析、方差分析、描述统计 | statsmodels / scipy |
+| 执行者 | `sk_learn_agent` | 分类、回归、聚类 | scikit-learn / XGBoost / LightGBM |
+| 执行者 | `data_viz_agent` | 交互式图表生成 | Plotly / Matplotlib / Seaborn |
+| 御史大夫 | `censor_agent` | 审查所有工作，可打回重做 | DSPy + LLM |
+
+### 🎯 智能体触发关键词
+
+| 智能体 | 触发关键词 |
+|--------|------------|
+| 数据可视化 | 可视化、画图、绘图、绘制、图表、plot、chart、graph、visual、figure、直方图、柱状图、散点图、折线图 |
+| 统计分析 | 统计、相关性、描述性、分布、均值、方差、分析、statistics、correlation、analysis、analyze |
+| 机器学习 | 建模、模型训练、机器学习、预测、回归、分类、聚类、model、predict、forecast、regression、classification、cluster |
+| 数据预处理 | 清洗、预处理、缺失值、填充、转换 |
 
 ## 🔄 工作流程
 
 1. **用户输入** → 丞相接收并细化任务
-2. **太尉规划** → 拆解为子任务并分发给执行智能体
-3. **执行协作** → 各执行智能体并行/串行完成子任务
-4. **御史审查** → 审查结果质量，决定是否打回
-5. **最终输出** → 返回给用户
+2. **任务判断** → 识别是否为纯报告请求
+3. **太尉规划** → 拆解为子任务并分发给执行智能体
+4. **执行协作** → 各执行智能体并行/串行完成子任务
+5. **御史审查** → 审查结果质量，决定是否打回（报告请求跳过审查）
+6. **报告生成** → 丞相整合所有结果生成综合报告
+7. **最终输出** → 返回给用户
 
 前端通过 **SSE（Server-Sent Events）** 实时展示各智能体状态：
 - 🔵 思考中（thinking）
@@ -184,17 +216,30 @@ DataPilot/
 
 | 方法 | 路径 | 功能 |
 |------|------|------|
+| GET | `/health` | 健康检查 |
 | POST | `/session` | 创建会话 |
-| POST | `/session/{id}/upload` | 上传数据文件（支持 CSV/XLSX/Parquet）|
-| GET | `/session/{id}/dataset` | 获取数据集信息 |
+| GET | `/session/{id}` | 获取会话信息 |
+| DELETE | `/session/{id}` | 删除会话 |
+| GET | `/session/{id}/model` | 获取模型配置 |
 | POST | `/session/{id}/model` | 设置模型配置（动态切换）|
+| POST | `/session/{id}/upload` | 上传数据文件（支持 CSV/XLSX/Parquet）|
+| POST | `/session/{id}/upload/batch` | 批量上传数据文件 |
+| GET | `/session/{id}/dataset` | 获取数据集信息 |
+| DELETE | `/session/{id}/dataset/{name}` | 删除数据集 |
+| POST | `/session/{id}/describe` | 描述数据集 |
 | POST | `/session/{id}/chat` | 与秦朝官职编排系统对话（SSE 流式）|
+| GET | `/session/{id}/history` | 获取对话历史 |
+| POST | `/session/{id}/chat-name` | 设置对话名称 |
 | POST | `/session/{id}/execute-code` | 执行 Python 代码 |
 | POST | `/session/{id}/fix-code` | AI 自动修复代码 |
+| POST | `/session/{id}/edit-code` | 编辑代码 |
 | GET | `/session/{id}/task-state` | 获取任务状态快照 |
 | GET | `/session/{id}/agents-status` | 获取所有智能体状态 |
+| POST | `/session/{id}/stop` | 停止任务 |
 | POST | `/session/{id}/review` | 人工审查介入（可选）|
 | GET | `/agents` | 获取智能体列表 |
+| POST | `/chat/{agent_name}` | 与特定智能体对话（旧版）|
+| POST | `/chat-legacy` | 旧版对话接口 |
 
 ### SSE 事件格式
 
@@ -203,7 +248,7 @@ DataPilot/
 {"type": "agent_status", "agent": "丞相", "status": "thinking", "content": "..."}
 
 // 最终结果
-{"type": "final", "content": "...", "status": "success"}
+{"type": "final", "content": "...", "status": "success", "mode": "report"}
 
 // 错误
 {"type": "error", "content": "..."}
@@ -214,11 +259,14 @@ DataPilot/
 **后端**
 - Python 3.10+
 - FastAPI — Web 框架
-- DSPy — LLM 编排框架
-- Pandas / NumPy — 数据处理
-- statsmodels — 统计分析
-- scikit-learn — 机器学习
-- Plotly — 可视化
+- DSPy 3.1.3 — LLM 编排框架
+- LiteLLM 1.82.3 — LLM 统一接口
+- Pandas 2.2.3 / NumPy 2.2.2 — 数据处理
+- statsmodels 0.14.4 — 统计分析
+- scikit-learn 1.6.1 — 机器学习
+- XGBoost 3.0.0 / LightGBM 4.6.0 — 梯度提升
+- Plotly 5.24.1 — 可视化
+- Matplotlib 3.10.0 / Seaborn 0.13.2 — 绘图
 
 **前端**
 - Next.js 14 — React 框架
@@ -226,7 +274,21 @@ DataPilot/
 - Tailwind CSS — 样式
 - Plotly.js — 图表渲染
 - react-markdown — Markdown 渲染
+- react-syntax-highlighter — 代码高亮
+- file-saver — 文件下载
 
 ## 📝 许可证
 
 本项目为 2026 年研电赛 AI 智能体专项赛道作品，仅供学习研究使用。
+
+## 🤝 贡献
+
+欢迎提交 Issue 和 Pull Request！
+
+## 📄 报告下载格式
+
+下载报告时，系统会生成以下文件：
+- `datapilot-analysis-report.md` — Markdown 报告文件
+- `chart_1.png`, `chart_2.png`, ... — 图表图片文件
+
+将这些文件放在同一目录下，Markdown 即可正确显示图片。

@@ -122,6 +122,62 @@ class chat_history_name_agent(dspy.Signature):
     name = dspy.OutputField(desc="A name for the chat history (max 3 words)")
 
 
+# ── 意图判定智能体 ─────────────────────────────────────────────────────
+
+class intent_classifier_agent(dspy.Signature):
+    """你是丞相的第二人格，一个意图判定专家，负责分析用户（秦始皇）查询并判断其意图。
+
+**职责：**
+1. 识别用户查询的类型（纯对话、执行请求、报告请求、重新执行请求等）
+2. 识别用户需要哪些执行智能体（数据预处理、统计分析、机器学习、数据可视化）
+3. 判断是否为纯报告请求（只要求撰写报告，不包含其他分析任务）
+4. 判断是否为对话请求（不需要执行数据分析）
+
+**输出格式（JSON）：**
+```json
+{
+  "is_conversation_only": false,
+  "is_report_requested": false,
+  "is_report_only": false,
+  "is_rerun_request": false,
+  "is_execution_request": true,
+  "requested_agents": {
+    "preprocessing_agent": false,
+    "statistical_analytics_agent": true,
+    "sk_learn_agent": false,
+    "data_viz_agent": true
+  }
+}
+```
+
+**字段说明：**
+- `is_conversation_only`: 是否为纯对话请求（解释、提问、打招呼等，不需要数据分析）
+- `is_report_requested`: 是否请求生成报告
+- `is_report_only`: 是否为纯报告请求（只写报告，不需要执行新的分析）
+- `is_rerun_request`: 是否请求重新执行上一轮任务
+- `is_execution_request`: 是否需要执行数据分析
+- `requested_agents`: 各执行智能体的需求状态
+
+**判定规则：**
+1. **is_conversation_only**: 用户只是询问概念、解释、定义等，没有要求执行任何分析
+2. **is_report_requested**: 用户明确要求生成报告、分析报告、总结报告等
+3. **is_report_only**: 用户只要求写报告，没有要求进行任何数据分析
+4. **is_rerun_request**: 用户要求重新执行、再次执行、复现上次任务等
+5. **is_execution_request**: 用户要求进行数据分析、统计、建模、可视化等
+6. **requested_agents**: 根据用户需求判断需要哪些执行智能体
+
+**智能体触发条件：**
+- preprocessing_agent: 需要数据清洗、预处理、缺失值处理、异常值处理、编码转换等
+- statistical_analytics_agent: 需要统计分析、相关性分析、描述性统计、回归分析等
+- sk_learn_agent: 需要机器学习建模、预测、分类、聚类等
+- data_viz_agent: 需要画图、绘图、可视化、生成图表等
+
+注意：如果 is_report_requested 为 true，可能会需要 data_viz_agent 来生成图表，需进一步确定。
+    """
+    user_query = dspy.InputField(desc="用户的原始查询")
+    intent_result = dspy.OutputField(desc="意图判定结果（JSON格式）")
+
+
 # ── 秦朝官职智能体 ─────────────────────────────────────────────────────
 
 class chancellor_agent(dspy.Signature):
@@ -751,6 +807,12 @@ class qin_dynasty_orchestrator(dspy.Module):
         # 辅助智能体
         self.code_fixer = asyncify_predict(code_fix)
         self.code_editor = asyncify_predict(code_edit)
+        
+        # 意图判定智能体 - 替代关键词判定
+        self.intent_classifier = asyncify_predict(intent_classifier_agent)
+        # 缓存最近的意图判定结果，避免重复调用
+        self._last_intent_result = None
+        self._last_intent_query = None
 
     def _default_subtasks(self, query):
         return self._infer_subtasks(query)
@@ -762,9 +824,144 @@ class qin_dynasty_orchestrator(dspy.Module):
         return any(term in text for term in terms)
 
     def _matches_any(self, text, patterns):
-        return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+        return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
+
+    async def _get_intent_result(self, query, session_lm):
+        """调用意图判定智能体获取意图结果，带缓存机制。"""
+        clean_query = self._clean_user_query(query)
+        
+        # 检查缓存
+        if self._last_intent_query == clean_query and self._last_intent_result is not None:
+            return self._last_intent_result
+        
+        try:
+            with dspy.context(lm=session_lm):
+                result = await self.intent_classifier(user_query=query)
+                intent_result = parse_json_object(result.intent_result, "intent_classifier")
+                
+                # 验证结果格式
+                if not isinstance(intent_result, dict):
+                    raise ValueError("意图判定结果必须是JSON对象")
+                
+                # 设置默认值
+                intent_result.setdefault("is_conversation_only", False)
+                intent_result.setdefault("is_report_requested", False)
+                intent_result.setdefault("is_report_only", False)
+                intent_result.setdefault("is_rerun_request", False)
+                intent_result.setdefault("is_execution_request", False)
+                intent_result.setdefault("requested_agents", {})
+                
+                # 缓存结果
+                self._last_intent_query = clean_query
+                self._last_intent_result = intent_result
+                
+                logger.info(f"意图判定结果: {json.dumps(intent_result, ensure_ascii=False)}")
+                return intent_result
+        except Exception as e:
+            logger.error(f"意图判定失败，使用关键词判定作为备用: {e}")
+            # 如果LLM判定失败，使用原来的关键词判定作为备用
+            return self._fallback_keyword_based_intent(query)
+
+    def _fallback_keyword_based_intent(self, query):
+        """基于关键词的意图判定（备用方案）。"""
+        normalized = self._clean_user_query(query)
+        
+        # 检查是否为重新执行请求
+        rerun_terms = ("再次执行", "重新执行", "再执行", "重跑", "再跑", "再跑一遍",
+                       "重新跑", "再做一遍", "重做", "复现上次", "重复执行",
+                       "执行之前的任务", "执行刚才的任务", "执行上一轮任务", "按照之前的任务再来",
+                       "rerun", "re-run", "run again", "execute again", "repeat the previous task")
+        is_rerun = any(term in normalized for term in rerun_terms)
+        
+        # 检查是否为纯对话请求
+        do_not_execute_terms = ("不要执行", "不用执行", "不要分析数据", "不用分析数据", "不需要分析",
+                               "不要跑代码", "不用跑代码", "不要调用智能体", "只聊天", "直接回答",
+                               "do not execute", "don't execute", "do not run code", "just chat")
+        explanation_terms = ("什么是", "是什么", "解释", "介绍", "说明", "怎么理解", "为什么",
+                            "怎么写", "如何写", "格式", "模板", "区别", "原理", "含义", "定义", "刚才", "刚刚", "之前", "上一轮",
+                            "上一次", "你做了什么", "what is", "explain", "describe", "why",
+                            "difference", "definition", "previous", "what did")
+        explicit_execution_patterns = (
+            r"(分析|统计|建模|预测|清洗|预处理|画图|绘图|可视化).{0,12}(数据|数据集|文件|表格)",
+            r"(帮我|请|开始|进行|执行|生成|输出|做|给我).{0,16}(分析|统计|建模|预测|清洗|预处理|可视化|图表|报告)",
+            r"(analyze|analyse|clean|preprocess|model|predict|forecast|plot|chart|visualize).{0,24}(data|dataset|file|table)")
+        
+        is_conversation_only = (any(term in normalized for term in do_not_execute_terms) or
+                               (any(term in normalized for term in explanation_terms) and
+                                not any(re.search(p, normalized, re.IGNORECASE) for p in explicit_execution_patterns)))
+        
+        # 检查是否为报告请求
+        negative_terms = ("不要报告", "不用报告", "不生成报告", "无需报告", "别生成报告",
+                         "no report", "do not generate a report", "don't generate a report")
+        if any(term in normalized for term in negative_terms):
+            is_report_requested = False
+        else:
+            report_explanation_terms = ("报告怎么写", "报告如何写", "报告格式", "报告模板", "怎么写报告", "如何写报告",
+                                       "how to write a report", "report format", "report template")
+            if any(term in normalized for term in report_explanation_terms):
+                is_report_requested = False
+            else:
+                report_patterns = (
+                    r"(生成|输出|出|写|整理|给我|要|需要).{0,12}(报告|分析报告|总结报告|研究报告|文档)",
+                    r"(报告|分析报告|总结报告|研究报告|文档).{0,12}(生成|输出|写|整理|图文并茂)",
+                    r"(generate|write|create|produce).{0,24}(report|analysis report|written report|document)",
+                    r"(report|analysis report|written report|document).{0,24}(with charts|rich|visual|figure)",
+                )
+                is_report_requested = any(re.search(p, normalized, re.IGNORECASE) for p in report_patterns)
+        
+        # 检查是否为纯报告请求
+        if is_report_requested:
+            analysis_terms = ("分析", "统计", "建模", "预测", "清洗", "预处理", "画图", "绘图", "可视化",
+                            "analyze", "analyse", "clean", "preprocess", "model", "predict", 
+                            "plot", "chart", "visualize")
+            report_only_patterns = (
+                r"^[\s\w]*报告[\s\w]*$",
+                r"^[\s\w]*总结[\s\w]*报告[\s\w]*$",
+                r"^[\s\w]*分析报告[\s\w]*$",
+                r"^[\s\w]*生成报告[\s\w]*$",
+                r"^[\s\w]*写报告[\s\w]*$",
+                r"^[\s\w]*给我报告[\s\w]*$",
+            )
+            is_report_only = (any(re.search(p, normalized, re.IGNORECASE) for p in report_only_patterns) or
+                             not any(term in normalized for term in analysis_terms))
+        else:
+            is_report_only = False
+        
+        # 检查执行请求
+        explicit_patterns = (
+            r"(分析|统计|建模|预测|清洗|预处理|画图|绘图|可视化).{0,12}(数据|数据集|文件|表格|样本|变量|字段)",
+            r"(数据|数据集|文件|表格|样本|变量|字段).{0,12}(分析|统计|建模|预测|清洗|预处理|画图|绘图|可视化)",
+            r"(帮我|请|开始|进行|执行|做|给我).{0,16}(分析|统计|建模|预测|清洗|预处理|可视化|图表)",
+            r"(analyze|analyse|clean|preprocess|model|predict|forecast|plot|chart|visualize).{0,24}(data|dataset|file|table)")
+        single_intent_terms = ("清洗数据", "预处理数据", "缺失值处理", "异常值处理", "训练模型",
+                              "机器学习建模", "做回归", "做分类", "做聚类", "画图", "绘图",
+                              "生成图表", "可视化", "analyze data", "clean data", "train model",
+                              "make a chart", "plot the data")
+        is_execution_request = ((is_report_requested and not is_report_only) or
+                               any(re.search(p, normalized, re.IGNORECASE) for p in explicit_patterns) or
+                               any(term in normalized for term in single_intent_terms))
+        
+        # 检查各智能体需求
+        requested_agents = {
+            "preprocessing_agent": any(term in normalized for term in ("预处理", "清洗", "缺失值", "异常值", "编码", "clean", "preprocess", "missing", "outlier")),
+            "statistical_analytics_agent": any(term in normalized for term in ("统计", "相关性", "描述性", "分布", "均值", "方差", "分析", "statistics", "correlation", "analysis", "analyze")) or is_report_requested,
+            "sk_learn_agent": any(term in normalized for term in ("建模", "模型训练", "机器学习", "预测", "回归", "分类", "聚类", "model", "predict", "forecast", "regression", "classification", "cluster")),
+            "data_viz_agent": any(term in normalized for term in ("可视化", "画图", "绘图", "绘制", "图表", "plot", "chart", "graph", "visual", "figure", "直方图", "柱状图", "散点图", "折线图")) or is_report_requested,
+        }
+        
+        return {
+            "is_conversation_only": is_conversation_only,
+            "is_report_requested": is_report_requested,
+            "is_report_only": is_report_only,
+            "is_rerun_request": is_rerun,
+            "is_execution_request": is_execution_request,
+            "requested_agents": requested_agents,
+        }
 
     def _is_report_requested(self, query):
+        """检测是否请求生成报告（需要在执行上下文中调用）。"""
+        # 这个方法现在只作为兼容接口，实际判定在execute_user_query中进行
+        # 保留关键词判定作为备用
         normalized = self._clean_user_query(query)
         negative_terms = (
             "不要报告", "不用报告", "不生成报告", "无需报告", "别生成报告",
@@ -776,7 +973,7 @@ class qin_dynasty_orchestrator(dspy.Module):
             "报告怎么写", "报告如何写", "报告格式", "报告模板", "怎么写报告", "如何写报告",
             "how to write a report", "report format", "report template",
         )
-        if self._contains_any(normalized, report_explanation_terms):
+        if any(term in normalized for term in report_explanation_terms):
             return False
         report_patterns = (
             r"(生成|输出|出|写|整理|给我|要|需要).{0,12}(报告|分析报告|总结报告|研究报告|文档)",
@@ -784,20 +981,19 @@ class qin_dynasty_orchestrator(dspy.Module):
             r"(generate|write|create|produce).{0,24}(report|analysis report|written report|document)",
             r"(report|analysis report|written report|document).{0,24}(with charts|rich|visual|figure)",
         )
-        return self._matches_any(normalized, report_patterns)
+        return any(re.search(p, normalized, re.IGNORECASE) for p in report_patterns)
 
     def _is_report_only_request(self, query):
         """检测纯报告请求（只要求撰写报告，不包含其他分析任务）。"""
+        # 这个方法现在只作为兼容接口，实际判定在execute_user_query中进行
         if not self._is_report_requested(query):
             return False
         normalized = self._clean_user_query(query)
-        # 检查是否包含其他分析指令
         analysis_terms = (
             "分析", "统计", "建模", "预测", "清洗", "预处理", "画图", "绘图", "可视化",
             "analyze", "analyse", "clean", "preprocess", "model", "predict", 
             "plot", "chart", "visualize",
         )
-        # 如果只包含报告相关词汇，不包含分析词汇，则是纯报告请求
         report_only_patterns = (
             r"^[\s\w]*报告[\s\w]*$",
             r"^[\s\w]*总结[\s\w]*报告[\s\w]*$",
@@ -806,15 +1002,15 @@ class qin_dynasty_orchestrator(dspy.Module):
             r"^[\s\w]*写报告[\s\w]*$",
             r"^[\s\w]*给我报告[\s\w]*$",
         )
-        # 检查是否是纯报告请求模式
-        if self._matches_any(normalized, report_only_patterns):
+        if any(re.search(p, normalized, re.IGNORECASE) for p in report_only_patterns):
             return True
-        # 如果没有任何分析相关词汇，也是纯报告请求
-        if not self._contains_any(normalized, analysis_terms):
+        if not any(term in normalized for term in analysis_terms):
             return True
         return False
 
     def _is_rerun_request(self, query):
+        """检测重新执行请求。"""
+        # 这个方法现在只作为兼容接口，实际判定在execute_user_query中进行
         normalized = self._clean_user_query(query)
         rerun_terms = (
             "再次执行", "重新执行", "再执行", "重跑", "再跑", "再跑一遍",
@@ -822,7 +1018,7 @@ class qin_dynasty_orchestrator(dspy.Module):
             "执行之前的任务", "执行刚才的任务", "执行上一轮任务", "按照之前的任务再来",
             "rerun", "re-run", "run again", "execute again", "repeat the previous task",
         )
-        return self._contains_any(normalized, rerun_terms)
+        return any(term in normalized for term in rerun_terms)
 
     def _subtasks_from_conversation_context(self, conversation_history):
         try:
@@ -878,6 +1074,13 @@ class qin_dynasty_orchestrator(dspy.Module):
     def _looks_like_execution_request(self, query):
         """Fast-path only explicit analytics requests; ambiguous text goes to the chancellor LLM."""
         normalized = self._clean_user_query(query)
+        
+        # 优先使用缓存的意图结果
+        if self._last_intent_query == normalized and self._last_intent_result is not None:
+            intent = self._last_intent_result
+            return intent.get("is_execution_request", False)
+        
+        # 备用：使用关键词判定
         if self._is_rerun_request(normalized):
             return False
         if self._is_conversation_only_request(normalized):
@@ -906,6 +1109,12 @@ class qin_dynasty_orchestrator(dspy.Module):
 
     def _requested_executor_intents(self, query):
         normalized = self._clean_user_query(query)
+        
+        # 优先使用缓存的意图结果
+        if self._last_intent_query == normalized and self._last_intent_result is not None:
+            return self._last_intent_result.get("requested_agents", {})
+        
+        # 备用：使用关键词判定
         return {
             "preprocessing_agent": self._contains_any(
                 normalized,
@@ -1682,6 +1891,28 @@ class qin_dynasty_orchestrator(dspy.Module):
         task_state.set_status("chancellor_agent", "thinking", task_id)
         yield ("chancellor_agent", "thinking", "正在理解您的指令并判断是否需要分发任务...")
         
+        # ── 使用 LLM 意图分类器进行意图判定 ──
+        intent_result = await self._get_intent_result(query, session_lm)
+        is_conversation_only = intent_result.get("is_conversation_only", False)
+        is_report_requested = intent_result.get("is_report_requested", False)
+        is_report_only = intent_result.get("is_report_only", False)
+        is_rerun_request = intent_result.get("is_rerun_request", False)
+        requested_agents = intent_result.get("requested_agents", {})
+        
+        # 如果是纯对话请求，直接响应
+        if is_conversation_only and not is_rerun_request:
+            direct_response = (
+                "这是解释、追问或明确不执行的对话请求，我不会启动后续数据分析智能体。"
+                "请直接说明你想了解的概念或上一轮结果中的哪一部分。"
+            )
+            task_state.set_status("chancellor_agent", "done", task_id)
+            task_state.add_message("秦始皇", "chancellor_agent", query, task_id)
+            task_state.add_message("chancellor_agent", "秦始皇", direct_response, task_id, "direct_response")
+            task_state.add_history("chancellor_agent", "执行保护：转为直接对话", direct_response, task_id)
+            yield ("chancellor_agent", "done", direct_response)
+            yield ("final", "done", {"mode": "chat", "response": direct_response})
+            return
+        
         try:
             with dspy.context(lm=session_lm):
                 chancellor_result = await asyncio.wait_for(
@@ -1710,25 +1941,13 @@ class qin_dynasty_orchestrator(dspy.Module):
                     yield ("final", "done", {"mode": "chat", "response": direct_response})
                     return
                 # 纯报告请求：直接由丞相根据历史记录生成报告
-                if str(refined_task.get("mode", "execute")).lower() == "report":
+                if str(refined_task.get("mode", "execute")).lower() == "report" or is_report_only:
                     task_state.set_status("chancellor_agent", "done", task_id)
                     task_state.add_message("秦始皇", "chancellor_agent", query, task_id)
                     report = await self._build_analysis_report_from_history(query, refined_task, task_state, chat_history, session_lm)
                     task_state.add_history("chancellor_agent", "分析报告生成完成", report, task_id)
                     # 只发送最终报告消息，不发送丞相的单独消息，避免重复显示
                     yield ("final", "done", {"mode": "report", "source_agent": "chancellor_agent", "content": report})
-                    return
-                if self._is_conversation_only_request(query):
-                    direct_response = (
-                        "这是解释、追问或明确不执行的对话请求，我不会启动后续数据分析智能体。"
-                        "请直接说明你想了解的概念或上一轮结果中的哪一部分。"
-                    )
-                    task_state.set_status("chancellor_agent", "done", task_id)
-                    task_state.add_message("秦始皇", "chancellor_agent", query, task_id)
-                    task_state.add_message("chancellor_agent", "秦始皇", direct_response, task_id, "direct_response")
-                    task_state.add_history("chancellor_agent", "执行保护：转为直接对话", direct_response, task_id)
-                    yield ("chancellor_agent", "done", direct_response)
-                    yield ("final", "done", {"mode": "chat", "response": direct_response})
                     return
                 # 确保 subtasks 存在，如果不存在则创建一个
                 if 'subtasks' not in refined_task:
@@ -1737,14 +1956,15 @@ class qin_dynasty_orchestrator(dspy.Module):
                 if len(refined_task.get('subtasks', [])) == 0:
                     logger.warning(f"丞相生成的 subtasks 为空，添加默认任务")
                     refined_task['subtasks'] = self._default_subtasks(query_with_timestamp)
-                refined_task["report_requested"] = self._is_report_requested(query)
+                # 使用 LLM 意图分类器的结果
+                refined_task["report_requested"] = is_report_requested
             except (json.JSONDecodeError, TypeError) as e:
                 logger.warning(f"丞相返回的细化任务解析失败: {e}, 原始输出: {refined_task_str[:500]}")
                 refined_task = {
                     "task_id": task_id,
                     "user_goal": query_with_timestamp,  # 使用带时间戳的查询
                     "refined_goal": refined_task_str,
-                    "report_requested": self._is_report_requested(query),
+                    "report_requested": is_report_requested,  # 使用 LLM 意图分类结果
                     "subtasks": self._default_subtasks(query_with_timestamp)
                 }
 

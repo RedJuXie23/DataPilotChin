@@ -214,45 +214,18 @@ DataPilot/
 
 ## 📡 API 端点
 
-| 方法 | 路径 | 功能 |
-|------|------|------|
-| GET | `/health` | 健康检查 |
-| POST | `/session` | 创建会话 |
-| GET | `/session/{id}` | 获取会话信息 |
-| DELETE | `/session/{id}` | 删除会话 |
-| GET | `/session/{id}/model` | 获取模型配置 |
-| POST | `/session/{id}/model` | 设置模型配置（动态切换）|
-| POST | `/session/{id}/upload` | 上传数据文件（支持 CSV/XLSX/Parquet）|
-| POST | `/session/{id}/upload/batch` | 批量上传数据文件 |
-| GET | `/session/{id}/dataset` | 获取数据集信息 |
-| DELETE | `/session/{id}/dataset/{name}` | 删除数据集 |
-| POST | `/session/{id}/describe` | 描述数据集 |
-| POST | `/session/{id}/chat` | 与秦朝官职编排系统对话（SSE 流式）|
-| GET | `/session/{id}/history` | 获取对话历史 |
-| POST | `/session/{id}/chat-name` | 设置对话名称 |
-| POST | `/session/{id}/execute-code` | 执行 Python 代码 |
-| POST | `/session/{id}/fix-code` | AI 自动修复代码 |
-| POST | `/session/{id}/edit-code` | 编辑代码 |
-| GET | `/session/{id}/task-state` | 获取任务状态快照 |
-| GET | `/session/{id}/agents-status` | 获取所有智能体状态 |
-| POST | `/session/{id}/stop` | 停止任务 |
-| POST | `/session/{id}/review` | 人工审查介入（可选）|
-| GET | `/agents` | 获取智能体列表 |
-| POST | `/chat/{agent_name}` | 与特定智能体对话（旧版）|
-| POST | `/chat-legacy` | 旧版对话接口 |
+| 类别 | 方法 | 路径 | 功能 |
+|------|------|------|------|
+| 会话管理 | POST/GET/DELETE | `/session` / `/session/{id}` | 创建/获取/删除会话 |
+| 模型配置 | GET/POST | `/session/{id}/model` | 获取/设置模型配置 |
+| 数据上传 | POST | `/session/{id}/upload` / `/batch` | 上传数据文件 |
+| 数据管理 | GET/DELETE/POST | `/session/{id}/dataset` / `/describe` | 数据集信息与描述 |
+| 核心对话 | POST | `/session/{id}/chat` | 与智能体系统对话（SSE 流式）|
+| 代码操作 | POST | `/session/{id}/execute-code` / `/fix-code` / `/edit-code` | 代码执行与修复 |
+| 任务控制 | GET/POST | `/session/{id}/task-state` / `/stop` / `/review` | 任务状态与控制 |
+| 智能体 | GET/POST | `/agents` / `/chat/{agent_name}` | 获取列表与单独对话 |
 
-### SSE 事件格式
-
-```json
-// 智能体状态更新
-{"type": "agent_status", "agent": "丞相", "status": "thinking", "content": "..."}
-
-// 最终结果
-{"type": "final", "content": "...", "status": "success", "mode": "report"}
-
-// 错误
-{"type": "error", "content": "..."}
-```
+> **SSE 事件类型**：`agent_status`（智能体状态）、`final`（最终结果）、`error`（错误）
 
 ## 🛠️ 技术栈
 

@@ -1902,8 +1902,8 @@ class qin_dynasty_orchestrator(dspy.Module):
         # 如果是纯对话请求，直接响应
         if is_conversation_only and not is_rerun_request:
             direct_response = (
-                "这是解释、追问或明确不执行的对话请求，我不会启动后续数据分析智能体。"
-                "请直接说明你想了解的概念或上一轮结果中的哪一部分。"
+                "陛下圣明。臣等悉听君令，愿为陛下效犬马之劳。"
+                "臣等愚钝，还请陛下明示您想了解的概念或上一轮结果中的哪一部分。"
             )
             task_state.set_status("chancellor_agent", "done", task_id)
             task_state.add_message("秦始皇", "chancellor_agent", query, task_id)

@@ -1713,7 +1713,7 @@ class qin_dynasty_orchestrator(dspy.Module):
                     task_state.add_message("秦始皇", "chancellor_agent", query, task_id)
                     report = await self._build_analysis_report_from_history(query, refined_task, task_state, chat_history, session_lm)
                     task_state.add_history("chancellor_agent", "分析报告生成完成", report, task_id)
-                    yield ("chancellor_agent", "done", report)
+                    # 只发送最终报告消息，不发送丞相的单独消息，避免重复显示
                     yield ("final", "done", {"mode": "report", "source_agent": "chancellor_agent", "content": report})
                     return
                 if self._is_conversation_only_request(query):

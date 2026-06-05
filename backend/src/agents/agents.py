@@ -77,13 +77,15 @@ async def _run_sync(fn, *args, **kwargs):
 def _create_and_call_predict(signature, **kwargs):
     """Create and call DSPy Predict object in the same context to avoid contextvar issues."""
     predictor = dspy.Predict(signature)
-    return predictor(**kwargs)
+    # 使用 rollout_id 强制刷新缓存，确保相同问题不会返回缓存结果
+    return predictor(**kwargs, config={"rollout_id": uuid.uuid4().hex[:16], "temperature": 1.0})
 
 
 def _create_and_call_cot(signature, **kwargs):
     """Create and call DSPy ChainOfThought object in the same context to avoid contextvar issues."""
     cot = dspy.ChainOfThought(signature)
-    return cot(**kwargs)
+    # 使用 rollout_id 强制刷新缓存，确保相同问题不会返回缓存结果
+    return cot(**kwargs, config={"rollout_id": uuid.uuid4().hex[:16], "temperature": 1.0})
 
 
 def asyncify_predict(signature):

@@ -64,7 +64,7 @@ npm run dev
 ### 3. 使用
 
 1. 打开浏览器访问 http://localhost:3000
-2. **配置 API**（点击左上角 ⚙️ 图标）：
+2. **配置 API**（点击左下角 ⚙️ 图标）：
    - 选择模型提供商（DeepSeek / OpenAI / Anthropic / Gemini / Groq）
    - 填入 API Key
    - 点击「保存」
@@ -261,7 +261,7 @@ DataPilot/
 - react-syntax-highlighter — 代码高亮
 - file-saver — 文件下载
 
-## 📝 许可证
+## 📝 许可
 
 本项目为 2026 年研电赛 AI 智能体专项赛道作品，仅供学习研究使用。
 
